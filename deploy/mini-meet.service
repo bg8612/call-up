@@ -1,0 +1,16 @@
+[Unit]
+Description=Mini Meet application
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mini-meet
+Environment=NODE_ENV=production
+Environment=PORT=3001
+ExecStart=/usr/bin/npm run start --workspace @mini-meet/server
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "name": "mini-meet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Full-stack web app for multi-user calls, chat, and screen sharing.",
+  "workspaces": [
+    "apps/web",
+    "apps/server"
+  ],
+  "scripts": {
+    "dev": "npm-run-all --parallel dev:server dev:web",
+    "dev:web": "npm run dev --workspace @mini-meet/web",
+    "dev:server": "npm run dev --workspace @mini-meet/server",
+    "build": "npm run build --workspace @mini-meet/server && npm run build --workspace @mini-meet/web",
+    "test": "npm run test --workspace @mini-meet/server && npm run test --workspace @mini-meet/web"
+  },
+  "devDependencies": {
+    "npm-run-all": "^4.1.5",
+    "playwright": "^1.59.1"
+  }
+}

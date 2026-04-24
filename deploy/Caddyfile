@@ -1,0 +1,4 @@
+144-31-166-71.sslip.io {
+  encode gzip zstd
+  reverse_proxy 127.0.0.1:3001
+}
