@@ -44,3 +44,7 @@ export type RemoteMediaState = {
   cameraStream?: MediaStream;
   screenStream?: MediaStream;
 };
+
+export type AudioOutputMediaElement = HTMLAudioElement & {
+  setSinkId?: (deviceId: string) => Promise<void>;
+};

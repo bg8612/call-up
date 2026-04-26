@@ -10,7 +10,8 @@ import { createRoomState, type ChatMessage, type RoomState } from './domain/room
 
 const joinRoomSchema = z.object({
   roomId: z.string().trim().min(2).max(64),
-  displayName: z.string().trim().min(1).max(48)
+  displayName: z.string().trim().min(1).max(48),
+  clientSessionId: z.string().trim().min(8).max(128).optional()
 });
 
 const signalSchema = z.object({
@@ -44,10 +45,18 @@ type JoinAck =
   | {
       ok: true;
       participantId: string;
+      clientSessionId: string;
       roomId: string;
       participants: ReturnType<RoomState['getParticipants']>;
       chatMessages: ChatMessage[];
       policy: ReturnType<RoomState['getPolicy']>;
+    }
+  | { ok: false; error: string };
+
+type MediaStateAck =
+  | {
+      ok: true;
+      participant: ReturnType<RoomState['getParticipants']>[number];
     }
   | { ok: false; error: string };
 
@@ -58,6 +67,8 @@ type SocketSession = {
 
 const rooms = new Map<string, RoomState>();
 const socketSessions = new Map<string, SocketSession>();
+const participantRemovalTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const RECONNECT_GRACE_MS = 60_000;
 
 const createId = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -77,6 +88,16 @@ const removeRoomIfEmpty = (roomId: string) => {
   if (room?.isEmpty()) {
     rooms.delete(roomId);
   }
+};
+
+const cancelParticipantRemoval = (participantId: string) => {
+  const timer = participantRemovalTimers.get(participantId);
+  if (!timer) {
+    return;
+  }
+
+  clearTimeout(timer);
+  participantRemovalTimers.delete(participantId);
 };
 
 const getSession = (socket: Socket) => {
@@ -127,6 +148,50 @@ export const createAppServer = () => {
     }
   });
 
+  const finalizeParticipantLeave = (roomId: string, participantId: string, participantName: string) => {
+    const room = rooms.get(roomId);
+    if (!room) {
+      removeRoomIfEmpty(roomId);
+      return;
+    }
+
+    const didLeave = room.leave(participantId);
+    cancelParticipantRemoval(participantId);
+
+    if (!didLeave) {
+      removeRoomIfEmpty(roomId);
+      return;
+    }
+
+    const systemMessage = room.addChatMessage(
+      createSystemMessage('System', `${participantName} left the room`)
+    );
+
+    io.to(roomId).emit('participant:left', {
+      participantId,
+      participants: room.getParticipants(),
+      message: systemMessage
+    });
+
+    removeRoomIfEmpty(roomId);
+  };
+
+  const scheduleParticipantRemoval = (roomId: string, participantId: string, participantName: string) => {
+    cancelParticipantRemoval(participantId);
+    const timer = setTimeout(() => {
+      const room = rooms.get(roomId);
+      const participant = room?.getParticipant(participantId);
+      if (!room || !participant || participant.connectionState !== 'reconnecting') {
+        cancelParticipantRemoval(participantId);
+        return;
+      }
+
+      finalizeParticipantLeave(roomId, participantId, participant.displayName || participantName);
+    }, RECONNECT_GRACE_MS);
+
+    participantRemovalTimers.set(participantId, timer);
+  };
+
   io.on('connection', (socket) => {
     console.log('[socket] connected', socket.id);
     socket.on('room:join', (payload: unknown, ack?: (response: JoinAck) => void) => {
@@ -137,26 +202,36 @@ export const createAppServer = () => {
       }
 
       const { roomId, displayName } = parsed.data;
+      const clientSessionId = parsed.data.clientSessionId?.trim() || `legacy_${roomId}_${socket.id}`;
       const room = getOrCreateRoom(roomId);
-      const participant = room.join({
+      const joinResult = room.join({
         socketId: socket.id,
-        displayName
+        displayName,
+        clientSessionId
       });
+      const participant = joinResult.participant;
 
       socket.join(roomId);
       socketSessions.set(socket.id, {
         roomId,
         participantId: participant.id
       });
+      cancelParticipantRemoval(participant.id);
 
-      const systemMessage = room.addChatMessage(
-        createSystemMessage('System', `${participant.displayName} joined the room`)
-      );
+      if (!joinResult.isRejoin) {
+        const systemMessage = room.addChatMessage(
+          createSystemMessage('System', `${participant.displayName} joined the room`)
+        );
 
-      socket.to(roomId).emit('participant:joined', {
-        participant,
-        message: systemMessage
-      });
+        socket.to(roomId).emit('participant:joined', {
+          participant,
+          message: systemMessage
+        });
+      } else {
+        socket.to(roomId).emit('participant:updated', {
+          participant
+        });
+      }
 
       const participantSnapshot = room.getParticipants();
       console.log('[room] joined', {
@@ -174,6 +249,7 @@ export const createAppServer = () => {
       ack?.({
         ok: true,
         participantId: participant.id,
+        clientSessionId,
         roomId,
         participants: participantSnapshot,
         chatMessages: room.getChatMessages(),
@@ -206,20 +282,23 @@ export const createAppServer = () => {
       });
     });
 
-    socket.on('participant:media-state', (payload: unknown) => {
+    socket.on('participant:media-state', (payload: unknown, ack?: (response: MediaStateAck) => void) => {
       const parsed = mediaStateSchema.safeParse(payload);
       if (!parsed.success) {
+        ack?.({ ok: false, error: 'Invalid media state payload' });
         return;
       }
 
       const session = socketSessions.get(socket.id);
       if (!session) {
+        ack?.({ ok: false, error: 'Socket is not joined to a room' });
         return;
       }
 
       const room = rooms.get(session.roomId);
       const participant = room?.getParticipant(session.participantId);
       if (!room || !participant) {
+        ack?.({ ok: false, error: 'Participant not found' });
         return;
       }
 
@@ -237,10 +316,15 @@ export const createAppServer = () => {
 
       const updated = room.updateParticipantMedia(session.participantId, patch);
       if (!updated) {
+        ack?.({ ok: false, error: 'Failed to update participant media' });
         return;
       }
 
-      io.to(session.roomId).emit('participant:updated', {
+      socket.to(session.roomId).emit('participant:updated', {
+        participant: updated
+      });
+      ack?.({
+        ok: true,
         participant: updated
       });
     });
@@ -306,6 +390,23 @@ export const createAppServer = () => {
       });
     });
 
+    socket.on('room:leave', () => {
+      const session = socketSessions.get(socket.id);
+      if (!session) {
+        return;
+      }
+
+      socketSessions.delete(socket.id);
+      const room = rooms.get(session.roomId);
+      const participant = room?.getParticipant(session.participantId);
+      if (!room || !participant) {
+        removeRoomIfEmpty(session.roomId);
+        return;
+      }
+
+      finalizeParticipantLeave(session.roomId, session.participantId, participant.displayName);
+    });
+
     socket.on('disconnect', (reason) => {
       const session = socketSessions.get(socket.id);
       console.log('[socket] disconnected', socket.id, reason);
@@ -317,25 +418,21 @@ export const createAppServer = () => {
 
       const room = rooms.get(session.roomId);
       const participant = room?.getParticipant(session.participantId);
-      const participantName = participant?.displayName ?? 'Guest';
-      const didLeave = room?.leave(session.participantId);
-
-      if (!room || !didLeave) {
+      if (!room || !participant) {
         removeRoomIfEmpty(session.roomId);
         return;
       }
 
-      const systemMessage = room.addChatMessage(
-        createSystemMessage('System', `${participantName} left the room`)
-      );
+      const updated = room.updateParticipantConnection(session.participantId, 'reconnecting');
+      if (!updated) {
+        removeRoomIfEmpty(session.roomId);
+        return;
+      }
 
-      io.to(session.roomId).emit('participant:left', {
-        participantId: session.participantId,
-        participants: room.getParticipants(),
-        message: systemMessage
+      io.to(session.roomId).emit('participant:updated', {
+        participant: updated
       });
-
-      removeRoomIfEmpty(session.roomId);
+      scheduleParticipantRemoval(session.roomId, session.participantId, participant.displayName);
     });
   });
 

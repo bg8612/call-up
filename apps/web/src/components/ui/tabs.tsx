@@ -32,7 +32,7 @@ export const TabsList = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HT
     <div
       ref={ref}
       className={cn(
-        'inline-flex h-11 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-1',
+        'inline-flex h-11 items-center gap-1 rounded-lg p-1',
         className
       )}
       {...props}
@@ -53,10 +53,10 @@ export const TabsTrigger = React.forwardRef<
       type="button"
       data-state={isActive ? 'active' : 'inactive'}
       className={cn(
-        'inline-flex h-9 items-center justify-center rounded-md border px-3 text-sm font-medium transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface)]',
+        'inline-flex h-9 items-center justify-center rounded-md px-3 text-sm font-normal transition-colors duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--surface)]',
         isActive
-          ? 'border-[var(--border-strong)] bg-[var(--surface-elevated)] text-[var(--text-primary)]'
-          : 'border-transparent text-[var(--text-secondary)] hover:border-[var(--border)] hover:bg-[var(--surface-muted)] hover:text-[var(--text-primary)]',
+          ? 'bg-[var(--surface-elevated)] text-[var(--text-primary)]'
+          : 'text-[var(--text-secondary)] hover:bg-[var(--surface-muted)] hover:text-[var(--text-primary)]',
         className
       )}
       onClick={() => setValue(value)}

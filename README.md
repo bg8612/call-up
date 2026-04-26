@@ -11,8 +11,8 @@ The current version is intentionally self-contained:
 
 ## Apps
 
-- `apps/server` — Express + Socket.IO signaling/chat backend
-- `apps/web` — React + Vite frontend with WebRTC mesh calls
+- `apps/server` � Express + Socket.IO signaling/chat backend
+- `apps/web` � React + Vite frontend with WebRTC mesh calls
 
 ## Development
 

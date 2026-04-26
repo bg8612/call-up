@@ -7,8 +7,9 @@ describe('createRoomState', () => {
 
     const owner = room.join({
       socketId: 'socket-owner',
-      displayName: 'Alex'
-    });
+      displayName: 'Alex',
+      clientSessionId: 'client-owner'
+    }).participant;
 
     room.addChatMessage({
       id: 'msg-1',
@@ -46,15 +47,47 @@ describe('createRoomState', () => {
 
     const first = room.join({
       socketId: 'socket-1',
-      displayName: 'Alex'
-    });
+      displayName: 'Alex',
+      clientSessionId: 'client-1'
+    }).participant;
     const second = room.join({
       socketId: 'socket-2',
-      displayName: 'Mira'
-    });
+      displayName: 'Mira',
+      clientSessionId: 'client-2'
+    }).participant;
 
     room.leave(first.id);
 
     expect(room.getParticipant(second.id)?.role).toBe('owner');
+  });
+
+  it('rejoins an existing participant when the same client session reconnects', () => {
+    const room = createRoomState('alpha-room');
+
+    const original = room.join({
+      socketId: 'socket-1',
+      displayName: 'Alex',
+      clientSessionId: 'client-1'
+    }).participant;
+
+    room.updateParticipantMedia(original.id, {
+      isCameraOn: true,
+      isMicOn: true
+    });
+    room.updateParticipantConnection(original.id, 'reconnecting');
+
+    const rejoined = room.join({
+      socketId: 'socket-2',
+      displayName: 'Alex',
+      clientSessionId: 'client-1'
+    });
+
+    expect(rejoined.isRejoin).toBe(true);
+    expect(rejoined.participant.id).toBe(original.id);
+    expect(rejoined.participant.socketId).toBe('socket-2');
+    expect(rejoined.participant.connectionState).toBe('connected');
+    expect(rejoined.participant.isCameraOn).toBe(true);
+    expect(rejoined.participant.isMicOn).toBe(true);
+    expect(room.getParticipants()).toHaveLength(1);
   });
 });

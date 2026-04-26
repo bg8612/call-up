@@ -1,4 +1,6 @@
 node_modules
+.codex-tools
+.codex-tools/
 dist
 coverage
 .env
@@ -9,3 +11,5 @@ npm-debug.log*
 *.log
 artifacts-smoke-*.png
 *.tar.gz
+.remote_*
+.tmp_*

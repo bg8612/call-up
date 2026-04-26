@@ -20,16 +20,25 @@ import type {
 type JoinForm = {
   roomId: string;
   displayName: string;
+  clientSessionId: string;
 };
 
 type JoinAck =
   | {
       ok: true;
       participantId: string;
+      clientSessionId: string;
       roomId: string;
       participants: WireParticipant[];
       chatMessages: ChatMessage[];
       policy: RoomPolicy;
+    }
+  | { ok: false; error: string };
+
+type MediaStateAck =
+  | {
+      ok: true;
+      participant: WireParticipant;
     }
   | { ok: false; error: string };
 
@@ -54,24 +63,85 @@ type PeerRecord = {
 type SpeakingMonitorCleanup = () => void;
 type SpeakingSource = 'camera' | 'screen';
 
-const rtcConfig: RTCConfiguration = {
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-};
-
 const emptyDevices: DeviceLists = {
   audioInputs: [],
   videoInputs: [],
   audioOutputs: []
 };
 
-const serverUrl =
-  import.meta.env.VITE_SERVER_URL ?? (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3001');
+const defaultStunServers = ['stun:stun.l.google.com:19302'];
 
-const SPEAKING_THRESHOLD = 0.06;
-const SPEAKING_ENTER_MS = 120;
-const SPEAKING_LEAVE_MS = 420;
+const parseIceServerUrls = (value?: string) =>
+  value
+    ?.split(',')
+    .map((item) => item.trim())
+    .filter(Boolean) ?? [];
+
+const createRtcConfig = (): RTCConfiguration => {
+  const iceServers: RTCIceServer[] = [];
+  const stunUrls = parseIceServerUrls(import.meta.env.VITE_STUN_URLS);
+  const turnUrls = parseIceServerUrls(import.meta.env.VITE_TURN_URLS);
+  const turnUsername = import.meta.env.VITE_TURN_USERNAME;
+  const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL;
+
+  iceServers.push({
+    urls: stunUrls.length ? stunUrls : defaultStunServers
+  });
+
+  if (turnUrls.length && turnUsername && turnCredential) {
+    iceServers.push({
+      urls: turnUrls,
+      username: turnUsername,
+      credential: turnCredential
+    });
+  }
+
+  return { iceServers };
+};
+
+const rtcConfig = createRtcConfig();
+
+const isLocalHostname = (hostname: string) =>
+  hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+
+const canUseLocalPreviewFallback = () => {
+  if (typeof window === 'undefined') {
+    return true;
+  }
+
+  return isLocalHostname(window.location.hostname);
+};
+
+const resolveServerUrl = () => {
+  if (import.meta.env.VITE_SERVER_URL) {
+    return import.meta.env.VITE_SERVER_URL;
+  }
+
+  if (typeof window === 'undefined') {
+    return 'http://localhost:3001';
+  }
+
+  if (window.location.port === '3001') {
+    return window.location.origin;
+  }
+
+  if (isLocalHostname(window.location.hostname) || window.location.port === '5173') {
+    return `${window.location.protocol}//${window.location.hostname}:3001`;
+  }
+
+  return window.location.origin;
+};
+
+const serverUrl = resolveServerUrl();
+
+const SPEAKING_THRESHOLD = 0.045;
+const SPEAKING_ENTER_MS = 45;
+const SPEAKING_LEAVE_MS = 180;
 const ANALYSER_FFT_SIZE = 512;
-const ANALYSER_SMOOTHING = 0.82;
+const ANALYSER_SMOOTHING = 0.62;
+const JOIN_ACK_TIMEOUT_MS = 8_000;
+const CAMERA_MAX_BITRATE = 1_500_000;
+const PEER_RECOVERY_DELAY_MS = 1_500;
 
 const cloneRemoteMap = (source: Map<string, RemoteMediaState>) =>
   new Map([...source.entries()].map(([key, value]) => [key, { ...value }]));
@@ -163,6 +233,7 @@ export const useCallRoom = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [devices, setDevices] = useState<DeviceLists>(emptyDevices);
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string>('');
+  const [selectedAudioOutputId, setSelectedAudioOutputId] = useState<string>('');
   const [selectedVideoInputId, setSelectedVideoInputId] = useState<string>('');
   const [localMediaStream, setLocalMediaStream] = useState<MediaStream | null>(null);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
@@ -172,6 +243,7 @@ export const useCallRoom = () => {
   const [isConnectingMedia, setIsConnectingMedia] = useState(false);
   const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, PeerRecord>>(new Map());
+  const peerRecoveryTimersRef = useRef<Map<string, number>>(new Map());
   const remoteStreamsRef = useRef<Map<string, RemoteMediaState>>(new Map());
   const localParticipantIdRef = useRef<string>('');
   const localMediaStreamRef = useRef<MediaStream | null>(null);
@@ -179,6 +251,16 @@ export const useCallRoom = () => {
   const callStateRef = useRef(callState);
   const speakingMonitorsRef = useRef<Map<string, SpeakingMonitorCleanup>>(new Map());
   const speakingSourcesRef = useRef<Map<string, Record<SpeakingSource, boolean>>>(new Map());
+  const localPreviewModeRef = useRef(false);
+  const activeJoinSessionRef = useRef<JoinForm | null>(null);
+  const joinAckTimerRef = useRef<number | null>(null);
+  const hasJoinedRoomRef = useRef(false);
+  const negotiatePeerConnectionRef = useRef<(participantId: string, iceRestart?: boolean) => Promise<void>>(
+    async () => undefined
+  );
+  const recoverPeerConnectionRef = useRef<(participantId: string, iceRestart?: boolean) => Promise<void>>(
+    async () => undefined
+  );
 
   useEffect(() => {
     callStateRef.current = callState;
@@ -204,6 +286,79 @@ export const useCallRoom = () => {
     setRemoteStreams(next);
   }, []);
 
+  const clearJoinAckTimer = useCallback(() => {
+    if (joinAckTimerRef.current === null) {
+      return;
+    }
+
+    window.clearTimeout(joinAckTimerRef.current);
+    joinAckTimerRef.current = null;
+  }, []);
+
+  const updateParticipantConnectionState = useCallback((participantId: string, connectionState: Participant['connectionState']) => {
+    const participant = callStateRef.current.participants.find((item) => item.id === participantId);
+    if (!participant) {
+      return;
+    }
+
+    dispatch({
+      type: 'participants/upserted',
+      participant: {
+        ...participant,
+        connectionState
+      }
+    });
+  }, []);
+
+  const clearPeerRecovery = useCallback((participantId: string) => {
+    const timer = peerRecoveryTimersRef.current.get(participantId);
+    if (timer === undefined) {
+      return;
+    }
+
+    window.clearTimeout(timer);
+    peerRecoveryTimersRef.current.delete(participantId);
+  }, []);
+
+  const schedulePeerRecovery = useCallback(
+    (participantId: string, iceRestart = false) => {
+      if (peerRecoveryTimersRef.current.has(participantId)) {
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        peerRecoveryTimersRef.current.delete(participantId);
+        void recoverPeerConnectionRef.current(participantId, iceRestart);
+      }, PEER_RECOVERY_DELAY_MS);
+
+      peerRecoveryTimersRef.current.set(participantId, timer);
+    },
+    []
+  );
+
+  const configureSenderParameters = useCallback(
+    async (sender: RTCRtpSender | undefined, senderKey: keyof PeerRecord['senders']) => {
+      if (!sender || senderKey !== 'cameraVideo' || typeof sender.getParameters !== 'function') {
+        return;
+      }
+
+      const parameters = sender.getParameters();
+      parameters.degradationPreference = 'balanced';
+      parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
+      parameters.encodings[0] = {
+        ...parameters.encodings[0],
+        maxBitrate: CAMERA_MAX_BITRATE
+      };
+
+      try {
+        await sender.setParameters(parameters);
+      } catch (error) {
+        console.warn('Failed to configure camera sender parameters', error);
+      }
+    },
+    []
+  );
+
   const enumerateDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
       return;
@@ -218,6 +373,7 @@ export const useCallRoom = () => {
 
     setDevices(nextDevices);
     setSelectedAudioInputId((current) => current || nextDevices.audioInputs[0]?.deviceId || '');
+    setSelectedAudioOutputId((current) => current || nextDevices.audioOutputs[0]?.deviceId || '');
     setSelectedVideoInputId((current) => current || nextDevices.videoInputs[0]?.deviceId || '');
   }, []);
 
@@ -228,25 +384,56 @@ export const useCallRoom = () => {
     return stream;
   }, []);
 
-  const sendMediaState = useCallback(() => {
+  const sendMediaState = useCallback(async () => {
     const socket = socketRef.current;
-    if (!socket) {
-      return;
-    }
-
     const cameraStream = localMediaStreamRef.current;
     const screenStream = localScreenStreamRef.current;
     const cameraVideoTrack = getTrackByKind(cameraStream, 'video');
     const cameraAudioTrack = getTrackByKind(cameraStream, 'audio');
     const screenAudioTrack = getTrackByKind(screenStream, 'audio');
-
-    socket.emit('participant:media-state', {
+    const mediaState = {
       isCameraOn: Boolean(cameraVideoTrack?.enabled),
       isMicOn: Boolean(cameraAudioTrack?.enabled),
       isScreenSharing: Boolean(getTrackByKind(screenStream, 'video')),
       isSharingAudio: Boolean(screenAudioTrack?.enabled),
       cameraStreamId: cameraStream?.id,
       screenStreamId: screenStream?.id
+    };
+
+    if (localParticipantIdRef.current) {
+      const existing = callStateRef.current.participants.find(
+        (participant) => participant.id === localParticipantIdRef.current
+      );
+
+      if (existing) {
+        dispatch({
+          type: 'participants/upserted',
+          participant: {
+            ...existing,
+            ...mediaState
+          }
+        });
+      }
+    }
+
+    if (!socket) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      socket.emit('participant:media-state', mediaState, (response: MediaStateAck) => {
+        if (response?.ok) {
+          dispatch({
+            type: 'participants/upserted',
+            participant: response.participant
+          });
+          setErrorMessage(null);
+        } else if (response?.error) {
+          setErrorMessage(response.error);
+        }
+
+        resolve();
+      });
     });
   }, []);
 
@@ -283,10 +470,23 @@ export const useCallRoom = () => {
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected') {
-          updateRemoteStreams((draft) => {
-            draft.delete(remoteParticipantId);
-          });
+        if (pc.connectionState === 'connected') {
+          clearPeerRecovery(remoteParticipantId);
+          return;
+        }
+
+        if (pc.connectionState === 'disconnected') {
+          schedulePeerRecovery(remoteParticipantId, true);
+          return;
+        }
+
+        if (pc.connectionState === 'failed') {
+          schedulePeerRecovery(remoteParticipantId, true);
+          return;
+        }
+
+        if (pc.connectionState === 'closed') {
+          clearPeerRecovery(remoteParticipantId);
         }
       };
 
@@ -304,31 +504,13 @@ export const useCallRoom = () => {
       };
 
       pc.onnegotiationneeded = async () => {
-        try {
-          peerRecord.makingOffer = true;
-          await syncPeerTracks(remoteParticipantId);
-          await pc.setLocalDescription();
-
-          if (pc.localDescription) {
-            socketRef.current?.emit('signal:send', {
-              targetParticipantId: remoteParticipantId,
-              signal: {
-                type: pc.localDescription.type as 'offer' | 'answer',
-                payload: pc.localDescription.toJSON()
-              }
-            });
-          }
-        } catch (error) {
-          console.error('Negotiation failed', error);
-        } finally {
-          peerRecord.makingOffer = false;
-        }
+        await negotiatePeerConnectionRef.current(remoteParticipantId);
       };
 
       peersRef.current.set(remoteParticipantId, peerRecord);
       return peerRecord;
     },
-    [updateRemoteStreams]
+    [clearPeerRecovery, schedulePeerRecovery, updateRemoteStreams]
   );
 
   const syncPeerTracks = useCallback(
@@ -341,19 +523,21 @@ export const useCallRoom = () => {
       const screenVideoTrack = getTrackByKind(screenStream, 'video');
       const screenAudioTrack = getTrackByKind(screenStream, 'audio');
 
-      const syncTrack = (
+      const syncTrack = async (
         senderKey: keyof PeerRecord['senders'],
         track: MediaStreamTrack | null,
         stream: MediaStream | null
       ) => {
         const currentSender = peer.senders[senderKey];
         if (track && currentSender) {
-          void currentSender.replaceTrack(track);
+          await currentSender.replaceTrack(track);
+          await configureSenderParameters(currentSender, senderKey);
           return;
         }
 
         if (track && !currentSender && stream) {
           peer.senders[senderKey] = peer.pc.addTrack(track, stream);
+          await configureSenderParameters(peer.senders[senderKey], senderKey);
           return;
         }
 
@@ -363,12 +547,12 @@ export const useCallRoom = () => {
         }
       };
 
-      syncTrack('cameraVideo', cameraVideoTrack, cameraStream);
-      syncTrack('cameraAudio', cameraAudioTrack, cameraStream);
-      syncTrack('screenVideo', screenVideoTrack, screenStream);
-      syncTrack('screenAudio', screenAudioTrack, screenStream);
+      await syncTrack('cameraVideo', cameraVideoTrack, cameraStream);
+      await syncTrack('cameraAudio', cameraAudioTrack, cameraStream);
+      await syncTrack('screenVideo', screenVideoTrack, screenStream);
+      await syncTrack('screenAudio', screenAudioTrack, screenStream);
     },
-    [ensurePeerRecord]
+    [configureSenderParameters, ensurePeerRecord]
   );
 
   const syncAllPeerTracks = useCallback(async () => {
@@ -381,9 +565,73 @@ export const useCallRoom = () => {
     }
   }, [syncPeerTracks]);
 
+  const negotiatePeerConnection = useCallback(
+    async (remoteParticipantId: string, iceRestart = false) => {
+      const peer = ensurePeerRecord(remoteParticipantId);
+      if (peer.makingOffer || peer.pc.signalingState !== 'stable') {
+        return;
+      }
+
+      try {
+        peer.makingOffer = true;
+        await syncPeerTracks(remoteParticipantId);
+        const offer = await peer.pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+        await peer.pc.setLocalDescription(offer);
+
+        if (peer.pc.localDescription) {
+          socketRef.current?.emit('signal:send', {
+            targetParticipantId: remoteParticipantId,
+            signal: {
+              type: 'offer',
+              payload: peer.pc.localDescription.toJSON()
+            }
+          });
+        }
+      } catch (error) {
+        console.error('Negotiation failed', error);
+      } finally {
+        peer.makingOffer = false;
+      }
+    },
+    [ensurePeerRecord, syncPeerTracks]
+  );
+
+  negotiatePeerConnectionRef.current = negotiatePeerConnection;
+
+  const recoverPeerConnection = useCallback(
+    async (remoteParticipantId: string, iceRestart = false) => {
+      const remoteParticipant = callStateRef.current.participants.find((participant) => participant.id === remoteParticipantId);
+      if (!remoteParticipant || remoteParticipant.id === localParticipantIdRef.current) {
+        return;
+      }
+
+      const existing = peersRef.current.get(remoteParticipantId);
+      if (existing?.pc.connectionState === 'connected') {
+        clearPeerRecovery(remoteParticipantId);
+        return;
+      }
+
+      if (iceRestart && existing && existing.pc.signalingState === 'stable') {
+        await negotiatePeerConnection(remoteParticipantId, true);
+        return;
+      }
+
+      existing?.pc.close();
+      peersRef.current.delete(remoteParticipantId);
+      clearPeerRecovery(remoteParticipantId);
+      ensurePeerRecord(remoteParticipantId);
+      await negotiatePeerConnection(remoteParticipantId, false);
+    },
+    [clearPeerRecovery, ensurePeerRecord, negotiatePeerConnection]
+  );
+
+  recoverPeerConnectionRef.current = recoverPeerConnection;
+
   const closeAllPeers = useCallback(() => {
     peersRef.current.forEach((peer) => peer.pc.close());
     peersRef.current.clear();
+    peerRecoveryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    peerRecoveryTimersRef.current.clear();
     remoteStreamsRef.current = new Map();
     setRemoteStreams(new Map());
   }, []);
@@ -481,13 +729,25 @@ export const useCallRoom = () => {
         const constraints =
           kind === 'audio'
             ? { audio: deviceId ? { deviceId: { exact: deviceId } } : true, video: false }
-            : { audio: false, video: deviceId ? { deviceId: { exact: deviceId } } : true };
+            : {
+                audio: false,
+                video: {
+                  deviceId: deviceId ? { exact: deviceId } : undefined,
+                  width: { ideal: 1280 },
+                  height: { ideal: 720 },
+                  frameRate: { ideal: 24, max: 30 }
+                }
+              };
 
         const requested = await navigator.mediaDevices.getUserMedia(constraints);
         const track = getTrackByKind(requested, kind);
 
         if (!track) {
           throw new Error(`No ${kind} track returned by getUserMedia`);
+        }
+
+        if (kind === 'video') {
+          track.contentHint = 'motion';
         }
 
         track.enabled = enabled;
@@ -599,8 +859,13 @@ export const useCallRoom = () => {
   );
 
   const teardown = useCallback(() => {
+    clearJoinAckTimer();
+    socketRef.current?.removeAllListeners();
     socketRef.current?.disconnect();
     socketRef.current = null;
+    activeJoinSessionRef.current = null;
+    hasJoinedRoomRef.current = false;
+    localPreviewModeRef.current = false;
     closeAllPeers();
     speakingMonitorsRef.current.forEach((cleanup) => cleanup());
     speakingMonitorsRef.current.clear();
@@ -611,38 +876,196 @@ export const useCallRoom = () => {
     localScreenStreamRef.current = null;
     setLocalMediaStream(null);
     setLocalScreenStream(null);
-  }, [closeAllPeers, stopAllTracks]);
+  }, [clearJoinAckTimer, closeAllPeers, stopAllTracks]);
 
   const leaveRoom = useCallback(() => {
+    socketRef.current?.emit('room:leave');
     teardown();
     localParticipantIdRef.current = '';
     dispatch({ type: 'session/reset' });
+    setErrorMessage(null);
     setJoinState('idle');
   }, [teardown]);
 
+  const startLocalPreviewSession = useCallback(
+    async ({ roomId, displayName, reason }: JoinForm & { reason?: string }) => {
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+      localPreviewModeRef.current = true;
+
+      const participantId = `local-preview-${Math.random().toString(36).slice(2, 10)}`;
+      localParticipantIdRef.current = participantId;
+
+      dispatch({
+        type: 'participants/synced',
+        participants: [
+          {
+            id: participantId,
+            displayName: displayName.trim() || 'Локальный просмотр',
+            role: 'owner',
+            isCameraOn: false,
+            isMicOn: false,
+            isSpeaking: false,
+            isScreenSharing: false,
+            isSharingAudio: false,
+            isPinned: false,
+            connectionState: 'connected'
+          }
+        ]
+      });
+      dispatch({
+        type: 'chat/messageReceived',
+        message: {
+          id: `msg_${Date.now()}`,
+          authorId: 'system',
+          authorName: 'Система',
+          text: reason
+            ? `Для комнаты «${roomId}» включён локальный режим предпросмотра. ${reason}`
+            : `Для комнаты «${roomId}» включён локальный режим предпросмотра.`,
+          kind: 'system',
+          createdAt: Date.now()
+        }
+      });
+
+      await enumerateDevices();
+      sendMediaState();
+      setErrorMessage(null);
+      setJoinState('joined');
+    },
+    [enumerateDevices, sendMediaState]
+  );
+
   const joinRoom = useCallback(
-    async ({ roomId, displayName }: JoinForm) => {
+    async ({ roomId, displayName, clientSessionId }: JoinForm) => {
       setJoinState('joining');
       setErrorMessage(null);
       dispatch({ type: 'session/reset' });
+      localParticipantIdRef.current = '';
+      localPreviewModeRef.current = false;
+      activeJoinSessionRef.current = { roomId, displayName, clientSessionId };
+      hasJoinedRoomRef.current = false;
+      clearJoinAckTimer();
+      socketRef.current?.removeAllListeners();
+      socketRef.current?.disconnect();
+      closeAllPeers();
 
+      const allowLocalPreview = canUseLocalPreviewFallback();
       const socket = io(serverUrl, {
-        transports: ['websocket']
+        transports: ['polling', 'websocket']
       });
 
       socketRef.current = socket;
+
+      const failInitialJoin = async (reason: string) => {
+        if (hasJoinedRoomRef.current) {
+          return;
+        }
+
+        clearJoinAckTimer();
+
+        if (allowLocalPreview) {
+          await startLocalPreviewSession({
+            roomId,
+            displayName,
+            clientSessionId,
+            reason
+          });
+          return;
+        }
+
+        socket.removeAllListeners();
+        socket.disconnect();
+        if (socketRef.current === socket) {
+          socketRef.current = null;
+        }
+        activeJoinSessionRef.current = null;
+        localParticipantIdRef.current = '';
+        dispatch({ type: 'session/reset' });
+        setErrorMessage(reason);
+        setJoinState('error');
+      };
+
+      const emitJoinRequest = () => {
+        const activeSession = activeJoinSessionRef.current;
+        if (!activeSession) {
+          return;
+        }
+
+        clearJoinAckTimer();
+        joinAckTimerRef.current = window.setTimeout(() => {
+          if (hasJoinedRoomRef.current) {
+            updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
+            return;
+          }
+
+          void failInitialJoin('Server did not confirm the room join in time. Check the connection and try again.');
+        }, JOIN_ACK_TIMEOUT_MS);
+
+        socket.emit('room:join', activeSession, async (response: JoinAck) => {
+          clearJoinAckTimer();
+
+          if (!response.ok) {
+            if (!hasJoinedRoomRef.current) {
+              await failInitialJoin(`The server rejected the join request: ${response.error}.`);
+            } else {
+              setErrorMessage(response.error);
+            }
+            return;
+          }
+
+          const isFirstJoin = !hasJoinedRoomRef.current;
+          hasJoinedRoomRef.current = true;
+          localParticipantIdRef.current = response.participantId;
+          activeJoinSessionRef.current = {
+            roomId: response.roomId,
+            displayName: activeSession.displayName,
+            clientSessionId: response.clientSessionId
+          };
+
+          dispatch({ type: 'participants/synced', participants: response.participants });
+          dispatch({ type: 'room/policySynced', policy: response.policy });
+
+          if (isFirstJoin) {
+            response.chatMessages.forEach((message) => {
+              dispatch({ type: 'chat/messageReceived', message });
+            });
+          }
+
+          await enumerateDevices();
+          await sendMediaState();
+          setErrorMessage(null);
+          setJoinState('joined');
+
+          for (const participant of response.participants) {
+            if (participant.id !== response.participantId && participant.connectionState === 'connected') {
+              clearPeerRecovery(participant.id);
+              await recoverPeerConnectionRef.current(participant.id);
+            }
+          }
+        });
+      };
+
+      socket.on('connect', () => {
+        if (hasJoinedRoomRef.current && localParticipantIdRef.current) {
+          updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
+        }
+
+        emitJoinRequest();
+      });
 
       socket.on('participant:joined', async ({ participant, message }: { participant: WireParticipant; message: ChatMessage }) => {
         dispatch({ type: 'participants/upserted', participant });
         dispatch({ type: 'chat/messageReceived', message });
 
         if (participant.id !== localParticipantIdRef.current) {
-          ensurePeerRecord(participant.id);
-          await syncPeerTracks(participant.id);
+          clearPeerRecovery(participant.id);
+          await recoverPeerConnectionRef.current(participant.id);
         }
       });
 
-      socket.on('participant:updated', ({ participant }: { participant: WireParticipant }) => {
+      socket.on('participant:updated', async ({ participant }: { participant: WireParticipant }) => {
+        const previous = callStateRef.current.participants.find((item) => item.id === participant.id);
+
         dispatch({ type: 'participants/upserted', participant });
         updateRemoteStreams((draft) => {
           const current = draft.get(participant.id);
@@ -657,11 +1080,21 @@ export const useCallRoom = () => {
 
           draft.set(participant.id, current);
         });
+
+        if (
+          participant.id !== localParticipantIdRef.current &&
+          participant.connectionState === 'connected' &&
+          previous?.connectionState === 'reconnecting'
+        ) {
+          clearPeerRecovery(participant.id);
+          await recoverPeerConnectionRef.current(participant.id);
+        }
       });
 
       socket.on(
         'participant:left',
         ({ participantId, participants, message }: { participantId: string; participants: WireParticipant[]; message: ChatMessage }) => {
+          clearPeerRecovery(participantId);
           peersRef.current.get(participantId)?.pc.close();
           peersRef.current.delete(participantId);
           updateRemoteStreams((draft) => {
@@ -696,30 +1129,38 @@ export const useCallRoom = () => {
       );
 
       socket.on('disconnect', () => {
-        setJoinState('idle');
-      });
+        clearJoinAckTimer();
 
-      socket.emit('room:join', { roomId, displayName }, async (response: JoinAck) => {
-        if (!response.ok) {
-          setJoinState('error');
-          setErrorMessage(response.error);
-          socket.disconnect();
+        if (!hasJoinedRoomRef.current) {
+          void failInitialJoin('Connection to the room server was interrupted before the join completed.');
           return;
         }
 
-        localParticipantIdRef.current = response.participantId;
-        dispatch({ type: 'participants/synced', participants: response.participants });
-        dispatch({ type: 'room/policySynced', policy: response.policy });
-        response.chatMessages.forEach((message) => {
-          dispatch({ type: 'chat/messageReceived', message });
-        });
+        updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
+      });
 
-        await enumerateDevices();
-        sendMediaState();
-        setJoinState('joined');
+      socket.on('connect_error', () => {
+        clearJoinAckTimer();
+
+        if (hasJoinedRoomRef.current) {
+          updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
+          return;
+        }
+
+        void failInitialJoin('Unable to connect to the room server. Check the network and try again.');
       });
     },
-    [ensurePeerRecord, enumerateDevices, handleSignal, sendMediaState, syncPeerTracks, updateRemoteStreams]
+    [
+      clearJoinAckTimer,
+      clearPeerRecovery,
+      closeAllPeers,
+      enumerateDevices,
+      handleSignal,
+      sendMediaState,
+      startLocalPreviewSession,
+      updateParticipantConnectionState,
+      updateRemoteStreams
+    ]
   );
 
   const stopScreenShare = useCallback(async () => {
@@ -764,11 +1205,38 @@ export const useCallRoom = () => {
       return;
     }
 
+    if (localPreviewModeRef.current) {
+      dispatch({
+        type: 'chat/messageReceived',
+        message: {
+          id: `msg_${Date.now()}`,
+          authorId: localParticipantIdRef.current,
+          authorName: localParticipant?.displayName ?? 'Вы',
+          text,
+          kind: 'user',
+          createdAt: Date.now()
+        }
+      });
+      setPendingMessage('');
+      return;
+    }
+
     socketRef.current?.emit('chat:send', { text });
     setPendingMessage('');
-  }, [pendingMessage]);
+  }, [localParticipant?.displayName, pendingMessage]);
 
   const updatePolicy = useCallback((patch: Partial<RoomPolicy>) => {
+    if (localPreviewModeRef.current) {
+      dispatch({
+        type: 'room/policySynced',
+        policy: {
+          ...callStateRef.current.policy,
+          ...patch
+        }
+      });
+      return;
+    }
+
     socketRef.current?.emit('room:policy', patch);
   }, []);
 
@@ -811,6 +1279,10 @@ export const useCallRoom = () => {
     [requestTrack]
   );
 
+  const applyAudioOutput = useCallback(async (deviceId: string) => {
+    setSelectedAudioOutputId(deviceId);
+  }, []);
+
   const toggleMicrophone = useCallback(async () => {
     const audioTrack = getTrackByKind(localMediaStreamRef.current, 'audio');
     if (!audioTrack) {
@@ -842,6 +1314,7 @@ export const useCallRoom = () => {
     remoteStreams,
     devices,
     selectedAudioInputId,
+    selectedAudioOutputId,
     selectedVideoInputId,
     pendingMessage,
     activePanel,
@@ -859,6 +1332,7 @@ export const useCallRoom = () => {
     updatePolicy,
     pinParticipant,
     applyAudioInput,
+    applyAudioOutput,
     applyVideoInput
   };
 };

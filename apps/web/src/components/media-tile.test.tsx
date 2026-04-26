@@ -1,11 +1,14 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+// @vitest-environment jsdom
+
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MediaTile } from './media-tile';
 import type { Participant } from '../features/call/types';
 
-const createStream = (withAudioTracks: number) =>
+const createStream = (withAudioTracks: number, withVideoTracks = 0) =>
   ({
-    getAudioTracks: () => Array.from({ length: withAudioTracks }, () => ({ kind: 'audio' }))
+    getAudioTracks: () => Array.from({ length: withAudioTracks }, () => ({ kind: 'audio' })),
+    getVideoTracks: () => Array.from({ length: withVideoTracks }, () => ({ kind: 'video' }))
   }) as unknown as MediaStream;
 
 const participantBase: Participant = {
@@ -22,39 +25,42 @@ const participantBase: Participant = {
 };
 
 describe('MediaTile', () => {
-  it('renders a remote audio element when microphone is on and camera is off', () => {
-    render(
-      <MediaTile
-        participant={participantBase}
-        media={{ cameraStream: createStream(1) }}
-        onPin={() => {}}
-      />
-    );
+  afterEach(() => {
+    cleanup();
+  });
 
-    expect(screen.getByTestId('remote-camera-audio')).toBeInTheDocument();
+  it('renders a remote audio element when microphone is on and camera is off', () => {
+    render(<MediaTile participant={participantBase} media={{ cameraStream: createStream(1) }} />);
+
+    expect(screen.getByTestId('remote-camera-audio')).toBeTruthy();
   });
 
   it('applies a speaking class without requiring video', () => {
-    render(
-      <MediaTile
-        participant={{ ...participantBase, isSpeaking: true }}
-        media={{ cameraStream: createStream(1) }}
-        onPin={() => {}}
-      />
-    );
+    render(<MediaTile participant={{ ...participantBase, isSpeaking: true }} media={{ cameraStream: createStream(1) }} />);
 
-    expect(screen.getByTestId('media-tile')).toHaveClass('media-tile-speaking');
+    expect(screen.getByTestId('media-tile').className).toContain('media-tile-speaking');
+    expect(screen.getByTestId('media-tile').querySelector('[data-speaking-indicator="true"]')).toBeTruthy();
   });
 
-  it('exposes an accessible pin toggle button', () => {
-    render(<MediaTile participant={participantBase} media={{ cameraStream: createStream(1) }} onPin={() => {}} />);
+  it('allows opening a tile in fullscreen mode by click', () => {
+    const handleSelect = vi.fn();
 
-    expect(screen.getByRole('button', { name: /pin mira/i })).toBeInTheDocument();
+    render(<MediaTile participant={participantBase} media={{ cameraStream: createStream(1) }} onSelect={handleSelect} />);    fireEvent.click(screen.getByRole('button', { name: /развернуть mira/i }));
+
+    expect(handleSelect).toHaveBeenCalledWith('remote-1');
   });
 
   it('shows a camera-off placeholder label when no video is available', () => {
-    render(<MediaTile participant={participantBase} onPin={() => {}} />);
+    render(<MediaTile participant={participantBase} />);
 
-    expect(screen.getByText(/video is currently unavailable/i)).toBeInTheDocument();
+    expect(screen.getByText('M')).toBeTruthy();
+  });
+
+  it('renders remote video as soon as a camera track is available', () => {
+    const { container } = render(
+      <MediaTile participant={{ ...participantBase, isCameraOn: true }} media={{ cameraStream: createStream(1, 1) }} />
+    );
+
+    expect(container.querySelector('video')).toBeTruthy();
   });
 });
