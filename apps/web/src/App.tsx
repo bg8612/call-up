@@ -63,7 +63,9 @@ const getViewportLayout = (): ViewportLayout => {
     topInset,
     bottomInset
   };
-};type StoredRoomSession = {
+};
+
+type StoredRoomSession = {
   roomId: string;
   displayName: string;
   clientSessionId: string;
@@ -126,6 +128,20 @@ const clearStoredRoomSession = () => {
   }
 
   window.sessionStorage.removeItem(ROOM_SESSION_STORAGE_KEY);
+};
+
+const readInitialStoredRoomSession = (invitedRoomId: string): StoredRoomSession | null => {
+  const storedSession = readStoredRoomSession();
+  if (!storedSession) {
+    return null;
+  }
+
+  if (invitedRoomId && storedSession.roomId !== invitedRoomId) {
+    clearStoredRoomSession();
+    return null;
+  }
+
+  return storedSession;
 };
 
 const generateRoomId = () => {
@@ -237,9 +253,12 @@ const statusTone = (message: ChatMessage) =>
     : 'border-[var(--border)] text-[var(--text-primary)]';
 
 function App() {
+  const initialInvitedRoomId = normalizeRoomId(readPrefilledRoomId(window.location.href));
   const [copiedInvite, setCopiedInvite] = useState<string | null>(null);
-  const [prefilledRoomId, setPrefilledRoomId] = useState(() => readPrefilledRoomId(window.location.href));
-  const [savedSession, setSavedSession] = useState<StoredRoomSession | null>(() => readStoredRoomSession());
+  const [prefilledRoomId, setPrefilledRoomId] = useState(initialInvitedRoomId);
+  const [savedSession, setSavedSession] = useState<StoredRoomSession | null>(() =>
+    readInitialStoredRoomSession(initialInvitedRoomId)
+  );
   const [fullscreenParticipantId, setFullscreenParticipantId] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const autoRejoinAttemptedRef = useRef(false);
@@ -449,7 +468,7 @@ function App() {
       <JoinView
         isJoining={joinState === 'joining'}
         errorMessage={errorMessage}
-        initialRoomId={prefilledRoomId}
+        initialRoomId={currentRoomId}
         onJoin={(formData) => {
           const roomId = normalizeRoomId(String(formData.get('roomId') ?? ''));
           const displayName = String(formData.get('displayName') ?? '').trim();
@@ -621,6 +640,7 @@ function App() {
                 size="icon"
                 variant="ghost"
                 aria-label="Покинуть звонок"
+                data-testid="leave-room"
                 onClick={handleLeaveRoom}
                 className="size-10 sm:size-11 rounded-full border-0 bg-[#ed4245] p-0 text-white shadow-none ring-offset-0 hover:border-0 hover:bg-[#f45b5e] hover:text-white"
               >
@@ -763,7 +783,12 @@ function App() {
                     <div className="font-semibold text-[var(--text-primary)]">Поделиться комнатой</div>
                     <div className="max-w-[52%] truncate text-[var(--text-secondary)]">{currentRoomId}</div>
                   </div>
-                  <Button variant="secondary" className="mt-3 w-full" onClick={() => void copyInviteLink(currentRoomId)}>
+                  <Button
+                    variant="secondary"
+                    className="mt-3 w-full"
+                    data-testid="copy-invite-link"
+                    onClick={() => void copyInviteLink(currentRoomId)}
+                  >
                     <Copy className="size-4" />
                     Скопировать ссылку
                   </Button>

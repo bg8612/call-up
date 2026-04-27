@@ -17,7 +17,7 @@ export type Participant = {
   screenStreamId?: string;
 };
 
-export type WireParticipant = Omit<Participant, 'isSpeaking'>;
+export type WireParticipant = Participant;
 
 export type ChatMessage = {
   id: string;

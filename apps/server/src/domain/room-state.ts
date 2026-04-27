@@ -1,8 +1,16 @@
+import type { KeyValueStore, ListStore, SingletonStore } from '../storage/contracts.js';
+import {
+  createInMemoryKeyValueStore,
+  createInMemoryListStore,
+  createInMemorySingletonStore
+} from '../storage/in-memory.js';
+
 export type ParticipantRole = 'owner' | 'participant';
 
 export type ParticipantMediaState = {
   isCameraOn: boolean;
   isMicOn: boolean;
+  isSpeaking: boolean;
   isScreenSharing: boolean;
   isSharingAudio: boolean;
   cameraStreamId?: string;
@@ -37,16 +45,44 @@ export type RoomPolicy = {
 export type JoinPayload = {
   socketId: string;
   displayName: string;
-  clientSessionId: string;
 };
 
-type InternalParticipant = ParticipantSnapshot & {
-  clientSessionId: string;
-};
+export type InternalParticipant = ParticipantSnapshot;
+
+export type ParticipantStore = KeyValueStore<string, InternalParticipant>;
+export type ChatMessageStore = ListStore<ChatMessage>;
+export type RoomPolicyStore = SingletonStore<RoomPolicy>;
 
 export type JoinResult = {
   participant: ParticipantSnapshot;
   isRejoin: boolean;
+};
+
+export type RoomState = {
+  roomId: string;
+  join(payload: JoinPayload): Promise<JoinResult>;
+  reconnect(participantId: string, payload: JoinPayload): Promise<ParticipantSnapshot | undefined>;
+  leave(participantId: string): Promise<boolean>;
+  updateParticipantMedia(
+    participantId: string,
+    patch: Partial<ParticipantMediaState>
+  ): Promise<ParticipantSnapshot | undefined>;
+  updateParticipantConnection(
+    participantId: string,
+    connectionState: ParticipantSnapshot['connectionState']
+  ): Promise<ParticipantSnapshot | undefined>;
+  updateParticipantSocket(
+    participantId: string,
+    socketId: string
+  ): Promise<ParticipantSnapshot | undefined>;
+  addChatMessage(message: ChatMessage): Promise<ChatMessage>;
+  updatePolicy(patch: Partial<RoomPolicy>): Promise<RoomPolicy>;
+  getPolicy(): Promise<RoomPolicy>;
+  getParticipant(participantId: string): Promise<ParticipantSnapshot | undefined>;
+  getParticipantBySocketId(socketId: string): Promise<ParticipantSnapshot | undefined>;
+  getParticipants(): Promise<ParticipantSnapshot[]>;
+  getChatMessages(): Promise<ChatMessage[]>;
+  isEmpty(): Promise<boolean>;
 };
 
 const defaultPolicy: RoomPolicy = {
@@ -58,16 +94,37 @@ const defaultPolicy: RoomPolicy = {
 const defaultMediaState: ParticipantMediaState = {
   isCameraOn: false,
   isMicOn: false,
+  isSpeaking: false,
   isScreenSharing: false,
   isSharingAudio: false
 };
 
 const createParticipantId = () => `p_${Math.random().toString(36).slice(2, 10)}`;
 
-export const createRoomState = (roomId: string) => {
-  const participants = new Map<string, InternalParticipant>();
-  const chatMessages: ChatMessage[] = [];
-  let policy: RoomPolicy = { ...defaultPolicy };
+type RoomStateStorageOptions = {
+  participantStore?: ParticipantStore;
+  chatMessageStore?: ChatMessageStore;
+  roomPolicyStore?: RoomPolicyStore;
+};
+
+export const createRoomState = (roomId: string, storage: RoomStateStorageOptions = {}): RoomState => {
+  const participants =
+    storage.participantStore ?? createInMemoryKeyValueStore<string, InternalParticipant>();
+  const chatMessages = storage.chatMessageStore ?? createInMemoryListStore<ChatMessage>();
+  // Policy is storage-backed so a future shared adapter can replace the in-memory implementation
+  // without rewriting room orchestration. Broader room metadata can follow the same pattern later.
+  const roomPolicyStore = storage.roomPolicyStore ?? createInMemorySingletonStore<RoomPolicy>();
+
+  const getStoredPolicy = async () => {
+    const existingPolicy = await roomPolicyStore.get();
+    if (existingPolicy) {
+      return existingPolicy;
+    }
+
+    const seededPolicy = { ...defaultPolicy };
+    await roomPolicyStore.set(seededPolicy);
+    return seededPolicy;
+  };
 
   const toPublicParticipant = (participant: InternalParticipant): ParticipantSnapshot => ({
     id: participant.id,
@@ -79,75 +136,74 @@ export const createRoomState = (roomId: string) => {
     connectionState: participant.connectionState,
     isCameraOn: participant.isCameraOn,
     isMicOn: participant.isMicOn,
+    isSpeaking: participant.isSpeaking,
     isScreenSharing: participant.isScreenSharing,
     isSharingAudio: participant.isSharingAudio,
     cameraStreamId: participant.cameraStreamId,
     screenStreamId: participant.screenStreamId
   });
 
-  const getParticipantByClientSessionId = (clientSessionId: string) =>
-    [...participants.values()].find((participant) => participant.clientSessionId === clientSessionId);
+  const reassignOwnerIfNeeded = async () => {
+    const values = await participants.values();
+    const currentOwner = values.find((participant) => participant.role === 'owner');
 
-  const reassignOwnerIfNeeded = () => {
-    const currentOwner = [...participants.values()].find((participant) => participant.role === 'owner');
-
-    if (currentOwner || participants.size === 0) {
+    if (currentOwner || values.length === 0) {
       return;
     }
 
-    const nextOwner = [...participants.values()].sort((a, b) => a.joinedAt - b.joinedAt)[0];
+    const nextOwner = values.sort((a, b) => a.joinedAt - b.joinedAt)[0];
     if (nextOwner) {
-      participants.set(nextOwner.id, { ...nextOwner, role: 'owner' });
+      await participants.set(nextOwner.id, { ...nextOwner, role: 'owner' });
     }
   };
 
   return {
     roomId,
-    join(payload: JoinPayload) {
-      const existing = getParticipantByClientSessionId(payload.clientSessionId);
-      if (existing) {
-        const updated: InternalParticipant = {
-          ...existing,
-          socketId: payload.socketId,
-          displayName: payload.displayName.trim() || existing.displayName,
-          connectionState: 'connected'
-        };
-
-        participants.set(updated.id, updated);
-        return {
-          participant: toPublicParticipant(updated),
-          isRejoin: true
-        };
-      }
-
+    async join(payload: JoinPayload) {
+      const participantCount = await participants.size();
       const participant: InternalParticipant = {
         id: createParticipantId(),
         socketId: payload.socketId,
         displayName: payload.displayName.trim() || 'Guest',
-        clientSessionId: payload.clientSessionId,
-        role: participants.size === 0 ? 'owner' : 'participant',
+        role: participantCount === 0 ? 'owner' : 'participant',
         joinedAt: Date.now(),
         isPinned: false,
         connectionState: 'connected',
         ...defaultMediaState
       };
 
-      participants.set(participant.id, participant);
+      await participants.set(participant.id, participant);
       return {
         participant: toPublicParticipant(participant),
         isRejoin: false
       };
     },
-    leave(participantId: string) {
-      const didDelete = participants.delete(participantId);
+    async reconnect(participantId: string, payload: JoinPayload) {
+      const participant = await participants.get(participantId);
+      if (!participant) {
+        return undefined;
+      }
+
+      const updated: InternalParticipant = {
+        ...participant,
+        socketId: payload.socketId,
+        displayName: payload.displayName.trim() || participant.displayName,
+        connectionState: 'connected'
+      };
+
+      await participants.set(updated.id, updated);
+      return toPublicParticipant(updated);
+    },
+    async leave(participantId: string) {
+      const didDelete = await participants.delete(participantId);
       if (didDelete) {
-        reassignOwnerIfNeeded();
+        await reassignOwnerIfNeeded();
       }
 
       return didDelete;
     },
-    updateParticipantMedia(participantId: string, patch: Partial<ParticipantMediaState>) {
-      const participant = participants.get(participantId);
+    async updateParticipantMedia(participantId: string, patch: Partial<ParticipantMediaState>) {
+      const participant = await participants.get(participantId);
       if (!participant) {
         return undefined;
       }
@@ -157,11 +213,14 @@ export const createRoomState = (roomId: string) => {
         ...patch
       };
 
-      participants.set(participantId, updated);
+      await participants.set(participantId, updated);
       return toPublicParticipant(updated);
     },
-    updateParticipantConnection(participantId: string, connectionState: ParticipantSnapshot['connectionState']) {
-      const participant = participants.get(participantId);
+    async updateParticipantConnection(
+      participantId: string,
+      connectionState: ParticipantSnapshot['connectionState']
+    ) {
+      const participant = await participants.get(participantId);
       if (!participant) {
         return undefined;
       }
@@ -171,11 +230,11 @@ export const createRoomState = (roomId: string) => {
         connectionState
       };
 
-      participants.set(participantId, updated);
+      await participants.set(participantId, updated);
       return toPublicParticipant(updated);
     },
-    updateParticipantSocket(participantId: string, socketId: string) {
-      const participant = participants.get(participantId);
+    async updateParticipantSocket(participantId: string, socketId: string) {
+      const participant = await participants.get(participantId);
       if (!participant) {
         return undefined;
       }
@@ -185,44 +244,43 @@ export const createRoomState = (roomId: string) => {
         socketId
       };
 
-      participants.set(participantId, updated);
+      await participants.set(participantId, updated);
       return toPublicParticipant(updated);
     },
-    addChatMessage(message: ChatMessage) {
-      chatMessages.push(message);
+    async addChatMessage(message: ChatMessage) {
+      await chatMessages.append(message);
       return message;
     },
-    updatePolicy(patch: Partial<RoomPolicy>) {
-      policy = {
-        ...policy,
+    async updatePolicy(patch: Partial<RoomPolicy>) {
+      const policy = {
+        ...(await getStoredPolicy()),
         ...patch
       };
+      await roomPolicyStore.set(policy);
 
       return policy;
     },
-    getPolicy() {
-      return { ...policy };
+    async getPolicy() {
+      return { ...(await getStoredPolicy()) };
     },
-    getParticipant(participantId: string) {
-      const participant = participants.get(participantId);
+    async getParticipant(participantId: string) {
+      const participant = await participants.get(participantId);
       return participant ? toPublicParticipant(participant) : undefined;
     },
-    getParticipantBySocketId(socketId: string) {
-      const participant = [...participants.values()].find((item) => item.socketId === socketId);
+    async getParticipantBySocketId(socketId: string) {
+      const values = await participants.values();
+      const participant = values.find((item) => item.socketId === socketId);
       return participant ? toPublicParticipant(participant) : undefined;
     },
-    getParticipants() {
-      return [...participants.values()]
-        .sort((a, b) => a.joinedAt - b.joinedAt)
-        .map(toPublicParticipant);
+    async getParticipants() {
+      const values = await participants.values();
+      return values.sort((a, b) => a.joinedAt - b.joinedAt).map(toPublicParticipant);
     },
-    getChatMessages() {
-      return [...chatMessages];
+    async getChatMessages() {
+      return chatMessages.list();
     },
-    isEmpty() {
-      return participants.size === 0;
+    async isEmpty() {
+      return (await participants.size()) === 0;
     }
   };
 };
-
-export type RoomState = ReturnType<typeof createRoomState>;

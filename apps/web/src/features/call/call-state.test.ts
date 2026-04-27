@@ -94,6 +94,7 @@ describe('reduceCallState', () => {
           role: 'owner',
           isCameraOn: false,
           isMicOn: false,
+          isSpeaking: false,
           isScreenSharing: false,
           isSharingAudio: false,
           isPinned: false,
@@ -116,6 +117,7 @@ describe('reduceCallState', () => {
         role: 'owner',
         isCameraOn: false,
         isMicOn: true,
+        isSpeaking: false,
         isScreenSharing: false,
         isSharingAudio: false,
         isPinned: false,
@@ -127,7 +129,7 @@ describe('reduceCallState', () => {
     expect(resynced.participants[0]).toEqual(
       expect.objectContaining({
         isMicOn: true,
-        isSpeaking: true
+        isSpeaking: false
       })
     );
   });

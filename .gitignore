@@ -13,3 +13,5 @@ artifacts-smoke-*.png
 *.tar.gz
 .remote_*
 .tmp_*
+.remote-*
+.tmp-*

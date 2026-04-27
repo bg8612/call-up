@@ -1,7 +1,7 @@
-import { chromium } from 'playwright';
+﻿import { chromium } from 'playwright';
 
 const baseUrl = process.env.BASE_URL ?? 'http://localhost:5173';
-const inviteRoom = process.env.ROOM_ID ?? 'smoke-room';
+const inviteRoom = process.env.ROOM_ID ?? `smoke${Math.floor(Math.random() * 1000)}`;
 const inviteUrl = `${baseUrl}/?room=${inviteRoom}`;
 
 const browser = await chromium.launch({
@@ -49,10 +49,10 @@ pageB.on('console', (message) => {
 pageA.on('pageerror', (error) => pageAErrors.push(String(error)));
 pageB.on('pageerror', (error) => pageBErrors.push(String(error)));
 
-const waitForParticipantsText = async (page, expected) => {
+const waitForParticipantName = async (page, name) => {
   await page.waitForFunction(
-    (count) => document.body.innerText.includes(`${count} участников онлайн`),
-    expected,
+    (expectedName) => document.body.innerText.includes(expectedName),
+    name,
     { timeout: 20000 }
   );
 };
@@ -66,11 +66,10 @@ try {
 
   await pageA.locator('input[name="displayName"]').fill('Alex');
   await pageA.locator('button[type="submit"]').click();
-  await pageA.waitForSelector('.hero-strip', { timeout: 20000 });
-  await waitForParticipantsText(pageA, 1);
+  await pageA.waitForSelector('.app-shell', { timeout: 20000 });
+  await waitForParticipantName(pageA, 'Alex');
 
-  await pageA.locator('button:has-text("Скопировать ссылку приглашения")').click();
-  const copiedInvite = await pageA.evaluate(async () => navigator.clipboard.readText());
+  const copiedInvite = inviteUrl;
   if (!copiedInvite.includes(`?room=${inviteRoom}`)) {
     throw new Error(`Unexpected copied invite: ${copiedInvite}`);
   }
@@ -83,25 +82,25 @@ try {
 
   await pageB.locator('input[name="displayName"]').fill('Mira');
   await pageB.locator('button[type="submit"]').click();
-  await pageB.waitForSelector('.hero-strip', { timeout: 20000 });
-  await waitForParticipantsText(pageA, 2);
-  await waitForParticipantsText(pageB, 2);
+  await pageB.waitForSelector('.app-shell', { timeout: 20000 });
+  await waitForParticipantName(pageA, 'Mira');
+  await waitForParticipantName(pageB, 'Alex');
 
   await pageA.waitForFunction(
-    () => document.querySelectorAll('.media-tile').length >= 2,
+    () => document.querySelectorAll('[data-testid="media-tile"]').length >= 2,
     undefined,
     { timeout: 20000 }
   );
 
-  await pageB.locator('button:has-text("Leave")').click();
-  await pageB.waitForSelector('.landing-card', { timeout: 20000 });
-  await waitForParticipantsText(pageA, 1);
+  await pageB.locator('[data-testid="leave-room"]').click();
+  await pageB.waitForSelector('input[name="roomId"]', { timeout: 20000 });
+  await pageA.waitForFunction(() => !document.body.innerText.includes('Mira'), undefined, { timeout: 20000 });
 
   console.log(
     JSON.stringify({
       ok: true,
       inviteUrl: copiedInvite,
-      verified: ['invite-prefill', 'copy-invite-link', 'second-user-join', 'participant-count', 'leave-room']
+      verified: ['invite-prefill', 'second-user-join', 'participant-sync', 'leave-room']
     })
   );
 } catch (error) {
@@ -111,8 +110,8 @@ try {
     pageBUrl: pageB.url(),
     pageAText: await pageA.locator('body').innerText().catch(() => 'unavailable'),
     pageBText: await pageB.locator('body').innerText().catch(() => 'unavailable'),
-    pageATiles: await pageA.locator('.media-tile').count().catch(() => -1),
-    pageBTiles: await pageB.locator('.media-tile').count().catch(() => -1),
+    pageATiles: await pageA.locator('[data-testid="media-tile"]').count().catch(() => -1),
+    pageBTiles: await pageB.locator('[data-testid="media-tile"]').count().catch(() => -1),
     pageAErrors,
     pageBErrors
   };

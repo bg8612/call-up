@@ -52,6 +52,7 @@ type PeerRecord = {
   makingOffer: boolean;
   ignoreOffer: boolean;
   isSettingRemoteAnswerPending: boolean;
+  pendingIceCandidates: RTCIceCandidateInit[];
   senders: {
     cameraVideo?: RTCRtpSender;
     cameraAudio?: RTCRtpSender;
@@ -142,6 +143,8 @@ const ANALYSER_SMOOTHING = 0.62;
 const JOIN_ACK_TIMEOUT_MS = 8_000;
 const CAMERA_MAX_BITRATE = 1_500_000;
 const PEER_RECOVERY_DELAY_MS = 1_500;
+const MEDIA_RECOVERY_GRACE_MS = 3_500;
+const SPEAKING_SYNC_MIN_INTERVAL_MS = 250;
 
 const cloneRemoteMap = (source: Map<string, RemoteMediaState>) =>
   new Map([...source.entries()].map(([key, value]) => [key, { ...value }]));
@@ -244,13 +247,15 @@ export const useCallRoom = () => {
   const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, PeerRecord>>(new Map());
   const peerRecoveryTimersRef = useRef<Map<string, number>>(new Map());
+  const mediaRecoveryTimersRef = useRef<Map<string, number>>(new Map());
   const remoteStreamsRef = useRef<Map<string, RemoteMediaState>>(new Map());
   const localParticipantIdRef = useRef<string>('');
   const localMediaStreamRef = useRef<MediaStream | null>(null);
   const localScreenStreamRef = useRef<MediaStream | null>(null);
   const callStateRef = useRef(callState);
   const speakingMonitorsRef = useRef<Map<string, SpeakingMonitorCleanup>>(new Map());
-  const speakingSourcesRef = useRef<Map<string, Record<SpeakingSource, boolean>>>(new Map());
+  const speakingSourcesRef = useRef<Record<SpeakingSource, boolean>>({ camera: false, screen: false });
+  const speakingSyncRef = useRef<{ value: boolean; sentAt: number }>({ value: false, sentAt: 0 });
   const localPreviewModeRef = useRef(false);
   const activeJoinSessionRef = useRef<JoinForm | null>(null);
   const joinAckTimerRef = useRef<number | null>(null);
@@ -319,6 +324,60 @@ export const useCallRoom = () => {
     window.clearTimeout(timer);
     peerRecoveryTimersRef.current.delete(participantId);
   }, []);
+
+  const clearMediaRecovery = useCallback((participantId: string) => {
+    const timer = mediaRecoveryTimersRef.current.get(participantId);
+    if (timer === undefined) {
+      return;
+    }
+
+    window.clearTimeout(timer);
+    mediaRecoveryTimersRef.current.delete(participantId);
+  }, []);
+
+  const hasExpectedRemoteMedia = useCallback((participantId: string, participant: Participant) => {
+    const media = remoteStreamsRef.current.get(participantId);
+    const hasCameraTrack = Boolean(getTrackByKind(media?.cameraStream ?? null, 'video'));
+    const hasMicTrack = Boolean(getTrackByKind(media?.cameraStream ?? null, 'audio'));
+    const hasScreenTrack = Boolean(getTrackByKind(media?.screenStream ?? null, 'video'));
+    const hasScreenAudio = Boolean(getTrackByKind(media?.screenStream ?? null, 'audio'));
+
+    const cameraSatisfied = !participant.isCameraOn || hasCameraTrack;
+    const micSatisfied = !participant.isMicOn || hasMicTrack;
+    const screenSatisfied = !participant.isScreenSharing || hasScreenTrack;
+    const screenAudioSatisfied = !participant.isSharingAudio || hasScreenAudio;
+    return cameraSatisfied && micSatisfied && screenSatisfied && screenAudioSatisfied;
+  }, []);
+
+  const ensureRemoteMediaRecovery = useCallback(
+    (participant: Participant) => {
+      if (
+        participant.id === localParticipantIdRef.current ||
+        participant.connectionState !== 'connected'
+      ) {
+        clearMediaRecovery(participant.id);
+        return;
+      }
+
+      const expectsAnyMedia = participant.isCameraOn || participant.isMicOn || participant.isScreenSharing || participant.isSharingAudio;
+      if (!expectsAnyMedia || hasExpectedRemoteMedia(participant.id, participant)) {
+        clearMediaRecovery(participant.id);
+        return;
+      }
+
+      if (mediaRecoveryTimersRef.current.has(participant.id)) {
+        return;
+      }
+
+      const timer = window.setTimeout(() => {
+        mediaRecoveryTimersRef.current.delete(participant.id);
+        void recoverPeerConnectionRef.current(participant.id, true);
+      }, MEDIA_RECOVERY_GRACE_MS);
+
+      mediaRecoveryTimersRef.current.set(participant.id, timer);
+    },
+    [clearMediaRecovery, hasExpectedRemoteMedia]
+  );
 
   const schedulePeerRecovery = useCallback(
     (participantId: string, iceRestart = false) => {
@@ -452,6 +511,7 @@ export const useCallRoom = () => {
         makingOffer: false,
         ignoreOffer: false,
         isSettingRemoteAnswerPending: false,
+        pendingIceCandidates: [],
         senders: {}
       };
 
@@ -501,6 +561,11 @@ export const useCallRoom = () => {
           current[bucket] = stream;
           draft.set(remoteParticipantId, current);
         });
+
+        const currentParticipant = callStateRef.current.participants.find((item) => item.id === remoteParticipantId);
+        if (currentParticipant) {
+          ensureRemoteMediaRecovery(currentParticipant);
+        }
       };
 
       pc.onnegotiationneeded = async () => {
@@ -510,7 +575,7 @@ export const useCallRoom = () => {
       peersRef.current.set(remoteParticipantId, peerRecord);
       return peerRecord;
     },
-    [clearPeerRecovery, schedulePeerRecovery, updateRemoteStreams]
+    [clearPeerRecovery, ensureRemoteMediaRecovery, schedulePeerRecovery, updateRemoteStreams]
   );
 
   const syncPeerTracks = useCallback(
@@ -632,6 +697,8 @@ export const useCallRoom = () => {
     peersRef.current.clear();
     peerRecoveryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     peerRecoveryTimersRef.current.clear();
+    mediaRecoveryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    mediaRecoveryTimersRef.current.clear();
     remoteStreamsRef.current = new Map();
     setRemoteStreams(new Map());
   }, []);
@@ -640,47 +707,71 @@ export const useCallRoom = () => {
     stream?.getTracks().forEach((track) => track.stop());
   }, []);
 
-  const updateSpeakingState = useCallback((participantId: string, source: SpeakingSource, isSpeaking: boolean) => {
-    const current = speakingSourcesRef.current.get(participantId) ?? { camera: false, screen: false };
-    current[source] = isSpeaking;
-    speakingSourcesRef.current.set(participantId, current);
+  const emitSpeakingState = useCallback((isSpeaking: boolean) => {
+    if (localPreviewModeRef.current) {
+      return;
+    }
 
-    dispatch({
-      type: 'participants/speakingChanged',
-      participantId,
-      isSpeaking: current.camera || current.screen
-    });
+    const socket = socketRef.current;
+    if (!socket || !localParticipantIdRef.current) {
+      return;
+    }
+
+    const now = Date.now();
+    const shouldSkip =
+      speakingSyncRef.current.value === isSpeaking &&
+      now - speakingSyncRef.current.sentAt < SPEAKING_SYNC_MIN_INTERVAL_MS;
+    if (shouldSkip) {
+      return;
+    }
+
+    speakingSyncRef.current = {
+      value: isSpeaking,
+      sentAt: now
+    };
+
+    socket.emit('participant:speaking-state', { isSpeaking });
   }, []);
 
-  useEffect(() => {
-    const desiredMonitors = new Map<string, { participantId: string; source: SpeakingSource; stream: MediaStream }>();
-    const localStream = localMediaStreamRef.current;
+  const updateLocalSpeakingSource = useCallback(
+    (source: SpeakingSource, isSpeaking: boolean) => {
+      speakingSourcesRef.current[source] = isSpeaking;
+      const aggregatedSpeaking = speakingSourcesRef.current.camera || speakingSourcesRef.current.screen;
+      const localParticipantId = localParticipantIdRef.current;
+      if (!localParticipantId) {
+        return;
+      }
 
-    if (localStream && getTrackByKind(localStream, 'audio')) {
-      desiredMonitors.set(`local:${localParticipantIdRef.current}:camera`, {
-        participantId: localParticipantIdRef.current,
+      dispatch({
+        type: 'participants/speakingChanged',
+        participantId: localParticipantId,
+        isSpeaking: aggregatedSpeaking
+      });
+
+      emitSpeakingState(aggregatedSpeaking);
+    },
+    [emitSpeakingState]
+  );
+
+  useEffect(() => {
+    const desiredMonitors = new Map<string, { source: SpeakingSource; stream: MediaStream }>();
+    const localStream = localMediaStreamRef.current;
+    const localScreen = localScreenStreamRef.current;
+    const localParticipantId = localParticipantIdRef.current;
+
+    if (localParticipantId && localStream && getTrackByKind(localStream, 'audio')) {
+      desiredMonitors.set('local:camera', {
         source: 'camera',
         stream: localStream
       });
     }
 
-    remoteStreams.forEach((mediaState, participantId) => {
-      if (mediaState.cameraStream && getTrackByKind(mediaState.cameraStream, 'audio')) {
-        desiredMonitors.set(`${participantId}:camera`, {
-          participantId,
-          source: 'camera',
-          stream: mediaState.cameraStream
-        });
-      }
-
-      if (mediaState.screenStream && getTrackByKind(mediaState.screenStream, 'audio')) {
-        desiredMonitors.set(`${participantId}:screen`, {
-          participantId,
-          source: 'screen',
-          stream: mediaState.screenStream
-        });
-      }
-    });
+    if (localParticipantId && localScreen && getTrackByKind(localScreen, 'audio')) {
+      desiredMonitors.set('local:screen', {
+        source: 'screen',
+        stream: localScreen
+      });
+    }
 
     speakingMonitorsRef.current.forEach((cleanup, key) => {
       const desired = desiredMonitors.get(key);
@@ -693,22 +784,20 @@ export const useCallRoom = () => {
       }
     });
 
-    desiredMonitors.forEach(({ participantId, source, stream }, key) => {
+    desiredMonitors.forEach(({ source, stream }, key) => {
       if (speakingMonitorsRef.current.has(key)) {
         return;
       }
 
       const cleanup = createSpeakingMonitor(stream, (isSpeaking) => {
-        if (participantId) {
-          updateSpeakingState(participantId, source, isSpeaking);
-        }
+        updateLocalSpeakingSource(source, isSpeaking);
       }) as SpeakingMonitorCleanup & { stream?: MediaStream };
       cleanup.stream = stream;
       speakingMonitorsRef.current.set(key, cleanup);
     });
 
     return () => undefined;
-  }, [localMediaStream, remoteStreams, updateSpeakingState]);
+  }, [localMediaStream, localScreenStream, updateLocalSpeakingSource]);
 
   const replaceLocalTrack = useCallback(
     async (kind: 'audio' | 'video', track: MediaStreamTrack) => {
@@ -819,7 +908,32 @@ export const useCallRoom = () => {
       const readyForOffer =
         !peer.makingOffer && (peer.pc.signalingState === 'stable' || peer.isSettingRemoteAnswerPending);
 
+      const flushPendingIceCandidates = async () => {
+        if (peer.pendingIceCandidates.length === 0) {
+          return;
+        }
+
+        const queuedCandidates = [...peer.pendingIceCandidates];
+        peer.pendingIceCandidates = [];
+
+        for (const queuedCandidate of queuedCandidates) {
+          try {
+            await peer.pc.addIceCandidate(queuedCandidate);
+          } catch (error) {
+            console.error('Failed to apply queued ICE candidate', error);
+          }
+        }
+      };
+
       if (signal.type === 'candidate') {
+        const hasRemoteDescription = Boolean(
+          peer.pc.remoteDescription ?? peer.pc.currentRemoteDescription ?? peer.pc.pendingRemoteDescription
+        );
+        if (!hasRemoteDescription) {
+          peer.pendingIceCandidates.push(signal.payload);
+          return;
+        }
+
         try {
           await peer.pc.addIceCandidate(signal.payload);
         } catch (error) {
@@ -830,16 +944,24 @@ export const useCallRoom = () => {
         return;
       }
 
-      const description = signal.payload;
+      const description = {
+        ...signal.payload,
+        type: signal.payload.type ?? signal.type
+      } satisfies RTCSessionDescriptionInit;
       const offerCollision = description.type === 'offer' && !readyForOffer;
       peer.ignoreOffer = !peer.polite && offerCollision;
       if (peer.ignoreOffer) {
         return;
       }
 
+      if (offerCollision) {
+        await peer.pc.setLocalDescription({ type: 'rollback' });
+      }
+
       peer.isSettingRemoteAnswerPending = description.type === 'answer';
       await peer.pc.setRemoteDescription(description);
       peer.isSettingRemoteAnswerPending = false;
+      await flushPendingIceCandidates();
 
       if (description.type === 'offer') {
         await syncPeerTracks(fromParticipantId);
@@ -869,7 +991,8 @@ export const useCallRoom = () => {
     closeAllPeers();
     speakingMonitorsRef.current.forEach((cleanup) => cleanup());
     speakingMonitorsRef.current.clear();
-    speakingSourcesRef.current.clear();
+    speakingSourcesRef.current = { camera: false, screen: false };
+    speakingSyncRef.current = { value: false, sentAt: 0 };
     stopAllTracks(localMediaStreamRef.current);
     stopAllTracks(localScreenStreamRef.current);
     localMediaStreamRef.current = null;
@@ -879,8 +1002,27 @@ export const useCallRoom = () => {
   }, [clearJoinAckTimer, closeAllPeers, stopAllTracks]);
 
   const leaveRoom = useCallback(() => {
-    socketRef.current?.emit('room:leave');
-    teardown();
+    const socket = socketRef.current;
+    let didTeardown = false;
+    const finishLeave = () => {
+      if (didTeardown) {
+        return;
+      }
+
+      didTeardown = true;
+      teardown();
+    };
+
+    if (socket?.connected) {
+      const fallbackTimer = window.setTimeout(finishLeave, 1_500);
+      socket.emit('room:leave', () => {
+        window.clearTimeout(fallbackTimer);
+        finishLeave();
+      });
+    } else {
+      finishLeave();
+    }
+
     localParticipantIdRef.current = '';
     dispatch({ type: 'session/reset' });
     setErrorMessage(null);
@@ -951,7 +1093,7 @@ export const useCallRoom = () => {
 
       const allowLocalPreview = canUseLocalPreviewFallback();
       const socket = io(serverUrl, {
-        transports: ['polling', 'websocket']
+        transports: ['websocket']
       });
 
       socketRef.current = socket;
@@ -1041,6 +1183,7 @@ export const useCallRoom = () => {
               clearPeerRecovery(participant.id);
               await recoverPeerConnectionRef.current(participant.id);
             }
+            ensureRemoteMediaRecovery(participant);
           }
         });
       };
@@ -1061,6 +1204,7 @@ export const useCallRoom = () => {
           clearPeerRecovery(participant.id);
           await recoverPeerConnectionRef.current(participant.id);
         }
+        ensureRemoteMediaRecovery(participant);
       });
 
       socket.on('participant:updated', async ({ participant }: { participant: WireParticipant }) => {
@@ -1089,12 +1233,14 @@ export const useCallRoom = () => {
           clearPeerRecovery(participant.id);
           await recoverPeerConnectionRef.current(participant.id);
         }
+        ensureRemoteMediaRecovery(participant);
       });
 
       socket.on(
         'participant:left',
         ({ participantId, participants, message }: { participantId: string; participants: WireParticipant[]; message: ChatMessage }) => {
           clearPeerRecovery(participantId);
+          clearMediaRecovery(participantId);
           peersRef.current.get(participantId)?.pc.close();
           peersRef.current.delete(participantId);
           updateRemoteStreams((draft) => {
@@ -1152,9 +1298,11 @@ export const useCallRoom = () => {
     },
     [
       clearJoinAckTimer,
+      clearMediaRecovery,
       clearPeerRecovery,
       closeAllPeers,
       enumerateDevices,
+      ensureRemoteMediaRecovery,
       handleSignal,
       sendMediaState,
       startLocalPreviewSession,
