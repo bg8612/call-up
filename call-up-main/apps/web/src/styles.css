@@ -1,0 +1,257 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "SF Pro";
+  src:
+    local("SF Pro Display Regular"),
+    local("SF Pro Text Regular"),
+    local("SF Pro"),
+    local("SFProDisplay-Regular"),
+    local("SFProText-Regular");
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "SF Pro";
+  src:
+    local("SF Pro Display Semibold"),
+    local("SF Pro Text Semibold"),
+    local("SFProDisplay-Semibold"),
+    local("SFProText-Semibold");
+  font-style: normal;
+  font-weight: 600;
+}
+
+:root {
+  color-scheme: dark;
+  font-family: "SF Pro", "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  --background: #090b10;
+  --surface: #10141c;
+  --surface-muted: #151a23;
+  --surface-elevated: #1a212d;
+  --surface-contrast: #1d2633;
+  --border: #242c39;
+  --border-strong: #313b4b;
+  --text-primary: #edf2fa;
+  --text-secondary: #93a0b4;
+  --accent: #5b7cff;
+  --accent-soft: #16233f;
+  --accent-soft-strong: #1d2d52;
+  --accent-border: #324b93;
+  --danger: #e05d68;
+  --danger-foreground: #ffe8eb;
+  --danger-soft: #33191d;
+  --danger-soft-strong: #472125;
+  --danger-border: #7a3942;
+  --success: #3cbf8b;
+  --warning: #e4a85c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100dvh;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-weight: 400;
+}
+
+.app-shell {
+  height: 100dvh;
+  padding-top: calc(env(safe-area-inset-top) + 0.75rem);
+  padding-bottom: calc(env(safe-area-inset-bottom) + 0.75rem);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 600;
+}
+
+p,
+span,
+label,
+input,
+select,
+textarea,
+button {
+  font-weight: 400;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+button {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: rgba(91, 124, 255, 0.28);
+  color: var(--text-primary);
+}
+
+.app-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.app-scrollbar::-webkit-scrollbar {
+  width: 10px;
+}
+
+.app-scrollbar::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+  background-color: var(--border-strong);
+}
+
+.chat-input-scrollbar {
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: none;
+  direction: ltr;
+  text-align: left;
+  caret-color: var(--text-primary);
+}
+
+.chat-input-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.chat-input-scrollbar::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+.chat-input-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-input-shell {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.875rem;
+  background: var(--surface-muted);
+}
+
+.chat-input-shell:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(91, 124, 255, 0.24);
+}
+
+.media-tile-speaking {
+  transform: none;
+}
+
+.media-tile-speaking::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 0 3px color-mix(in srgb, #ffffff 42%, var(--accent)),
+    0 0 0 2px color-mix(in srgb, var(--accent) 60%, transparent),
+    0 0 28px color-mix(in srgb, var(--accent) 55%, transparent),
+    0 0 48px color-mix(in srgb, var(--accent) 30%, transparent);
+  animation: media-tile-speaking-pulse 1.2s ease-in-out infinite;
+}
+
+.media-tile-speaking [data-speaking-indicator='true'] {
+  opacity: 1;
+  background:
+    radial-gradient(circle at top, color-mix(in srgb, var(--accent) 24%, transparent), transparent 56%),
+    linear-gradient(180deg, color-mix(in srgb, #dce6ff 10%, transparent), transparent 40%);
+}
+
+@keyframes media-tile-speaking-pulse {
+  0% {
+    box-shadow:
+      inset 0 0 0 3px color-mix(in srgb, #ffffff 30%, var(--accent)),
+      0 0 0 2px color-mix(in srgb, var(--accent) 42%, transparent),
+      0 0 18px color-mix(in srgb, var(--accent) 34%, transparent),
+      0 0 34px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  50% {
+    box-shadow:
+      inset 0 0 0 3px color-mix(in srgb, #ffffff 50%, var(--accent)),
+      0 0 0 2px color-mix(in srgb, var(--accent) 70%, transparent),
+      0 0 30px color-mix(in srgb, var(--accent) 58%, transparent),
+      0 0 56px color-mix(in srgb, var(--accent) 34%, transparent);
+  }
+
+  100% {
+    box-shadow:
+      inset 0 0 0 3px color-mix(in srgb, #ffffff 30%, var(--accent)),
+      0 0 0 2px color-mix(in srgb, var(--accent) 42%, transparent),
+      0 0 18px color-mix(in srgb, var(--accent) 34%, transparent),
+      0 0 34px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+}
+
+.settings-select-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 1rem;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0)),
+    linear-gradient(135deg, rgba(91, 124, 255, 0.1), rgba(91, 124, 255, 0));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 14px 34px rgba(4, 8, 18, 0.28);
+}
+
+.settings-select {
+  position: relative;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(22, 26, 35, 0.96), rgba(13, 16, 23, 0.98));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.settings-select:hover {
+  border-color: var(--border-strong);
+  background: linear-gradient(180deg, rgba(25, 31, 43, 0.98), rgba(14, 18, 27, 0.98));
+}
+
+.settings-select:focus-visible {
+  border-color: var(--accent-border);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 0 0 3px rgba(91, 124, 255, 0.16),
+    0 18px 40px rgba(12, 18, 34, 0.38);
+}
+
+.settings-select option {
+  background: #0f131b;
+  color: var(--text-primary);
+}

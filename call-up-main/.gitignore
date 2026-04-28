@@ -1,0 +1,17 @@
+node_modules
+.codex-tools
+.codex-tools/
+dist
+coverage
+.env
+.env.*
+*.local
+npm-debug.log*
+*.tsbuildinfo
+*.log
+artifacts-smoke-*.png
+*.tar.gz
+.remote_*
+.tmp_*
+.remote-*
+.tmp-*
