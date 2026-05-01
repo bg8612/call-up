@@ -28,6 +28,7 @@ export const createReconnectLifecycle = ({
 
     clearTimeout(timer);
     await timerStore.delete(participantId);
+    console.log('[reconnect] timer canceled', { participantId });
     return true;
   };
 
@@ -40,6 +41,12 @@ export const createReconnectLifecycle = ({
     if (!existingTimer) {
       const timerCount = await timerStore.size();
       if (timerCount >= maxTimers) {
+        console.warn('[reconnect] timer scheduling rejected', {
+          participantId,
+          roomId,
+          reason: 'MAX_TIMERS_REACHED',
+          maxTimers
+        });
         return {
           ok: false as const,
           reason: 'MAX_TIMERS_REACHED' as const
@@ -50,6 +57,7 @@ export const createReconnectLifecycle = ({
     await cancelParticipantRemoval(participantId);
     const timer = setTimeout(() => {
       void timerStore.delete(participantId);
+      console.log('[reconnect] timer expired', { roomId, participantId });
       void onParticipantGraceExpired({
         roomId,
         participantId,
@@ -58,6 +66,7 @@ export const createReconnectLifecycle = ({
     }, reconnectGraceMs);
 
     await timerStore.set(participantId, timer);
+    console.log('[reconnect] timer scheduled', { roomId, participantId, reconnectGraceMs });
     return {
       ok: true as const
     };

@@ -853,10 +853,16 @@ function App() {
                             value={selectedAudioOutputId}
                             ariaLabel="Выбор устройства вывода звука"
                             placeholder="Устройство вывода по умолчанию"
-                            options={devices.audioOutputs.map((device) => ({
-                              value: device.deviceId,
-                              label: device.label || 'Устройство вывода по умолчанию'
-                            }))}
+                            options={[
+                              {
+                                value: '',
+                                label: 'Системное устройство вывода (по умолчанию)'
+                              },
+                              ...devices.audioOutputs.map((device) => ({
+                                value: device.deviceId,
+                                label: device.label || 'Устройство вывода по умолчанию'
+                              }))
+                            ]}
                             onChange={(nextValue) => void applyAudioOutput(nextValue)}
                           />
                         </label>

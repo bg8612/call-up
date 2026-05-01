@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { MediaTile } from './media-tile';
 import type { Participant } from '../features/call/types';
 
@@ -25,8 +25,28 @@ const participantBase: Participant = {
 };
 
 describe('MediaTile', () => {
+  const originalPlay = HTMLMediaElement.prototype.play;
+  const installResolvedPlayMock = () => {
+    Object.defineProperty(HTMLMediaElement.prototype, 'play', {
+      configurable: true,
+      value: vi.fn().mockResolvedValue(undefined)
+    });
+  };
+
+  beforeAll(() => {
+    installResolvedPlayMock();
+  });
+
+  afterAll(() => {
+    Object.defineProperty(HTMLMediaElement.prototype, 'play', {
+      configurable: true,
+      value: originalPlay
+    });
+  });
+
   afterEach(() => {
     cleanup();
+    installResolvedPlayMock();
   });
 
   it('renders a remote audio element when microphone is on and camera is off', () => {
@@ -63,4 +83,5 @@ describe('MediaTile', () => {
 
     expect(container.querySelector('video')).toBeTruthy();
   });
+
 });

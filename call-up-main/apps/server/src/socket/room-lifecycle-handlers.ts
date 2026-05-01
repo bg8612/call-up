@@ -1,6 +1,7 @@
 import type { Server, Socket } from 'socket.io';
 import type { ReconnectLifecycle } from '../services/reconnect-lifecycle.js';
 import type { BackendMetrics } from '../services/backend-metrics.js';
+import type { AnonymousAuthRegistry } from '../services/anonymous-auth-registry.js';
 import type { ParticipantSessionTokenService } from '../services/participant-session-token.js';
 import type { ClientSessionMapping } from '../services/client-session-mapping.js';
 import type { RoomOrchestrationService } from '../services/room-orchestration.js';
@@ -18,6 +19,7 @@ type AttachRoomLifecycleHandlersOptions = {
   roomBroadcaster: RoomBroadcaster;
   reconnectLifecycle: ReconnectLifecycle;
   metrics: BackendMetrics;
+  anonymousAuthRegistry: AnonymousAuthRegistry;
 };
 
 export const attachRoomLifecycleHandlers = ({
@@ -29,9 +31,11 @@ export const attachRoomLifecycleHandlers = ({
   sessionMapping,
   roomBroadcaster,
   reconnectLifecycle,
-  metrics
+  metrics,
+  anonymousAuthRegistry
 }: AttachRoomLifecycleHandlersOptions) => {
   let isExplicitLeaveInProgress = false;
+  let joinAttemptCounter = 0;
 
   const evictSocketFromRoom = (socketId: string | undefined, roomId: string | undefined, reason: string) => {
     if (!socketId || !roomId || socketId === socket.id) {
@@ -51,13 +55,20 @@ export const attachRoomLifecycleHandlers = ({
   };
 
   socket.on('room:join', async (payload: unknown, ack?: (response: JoinAck) => void) => {
+    const joinAttemptId = `${socket.id}:${++joinAttemptCounter}`;
     const parsed = joinRoomSchema.safeParse(payload);
     if (!parsed.success) {
+      console.warn('[room] join rejected invalid payload', { joinAttemptId, socketId: socket.id });
       ack?.({ ok: false, error: 'Invalid join payload' });
       return;
     }
 
     const { roomId, displayName } = parsed.data;
+    const anonymousAuthToken = parsed.data.anonymousAuthToken?.trim();
+    if (!anonymousAuthToken) {
+      ack?.({ ok: false, error: 'Anonymous authorization token is required' });
+      return;
+    }
     const sessionToken = parsed.data.sessionToken?.trim();
     const clientSessionId = parsed.data.clientSessionId?.trim();
     const reconnectIdentityFromToken = sessionTokenService.verify(sessionToken);
@@ -73,13 +84,83 @@ export const attachRoomLifecycleHandlers = ({
             participantId: mappedParticipantId
           }
         : undefined);
+    const tokenBinding = await anonymousAuthRegistry.getBinding(anonymousAuthToken);
+    const reconnectParticipantToken = reconnectIdentity?.participantId
+      ? await anonymousAuthRegistry.getTokenForParticipant(reconnectIdentity.participantId)
+      : undefined;
+    if (
+      reconnectParticipantToken &&
+      reconnectParticipantToken !== anonymousAuthToken &&
+      reconnectIdentity?.roomId === roomId
+    ) {
+      ack?.({
+        ok: false,
+        error: 'Anonymous authorization token does not match the existing browser identity for this participant.'
+      });
+      return;
+    }
+    const isReconnectWithSameParticipant =
+      Boolean(reconnectIdentity?.participantId) &&
+      tokenBinding?.participantId === reconnectIdentity?.participantId &&
+      tokenBinding?.roomId === roomId;
+    if (tokenBinding && !isReconnectWithSameParticipant) {
+      const sameRoom = tokenBinding.roomId === roomId;
+      if (sameRoom) {
+        ack?.({
+          ok: false,
+          error: 'This browser has already joined this room. Re-entry is blocked for the same anonymous token.'
+        });
+        return;
+      }
+
+      console.log('[room] anonymous token transfer', {
+        joinAttemptId,
+        socketId: socket.id,
+        fromRoomId: tokenBinding.roomId,
+        toRoomId: roomId,
+        participantId: tokenBinding.participantId
+      });
+      await reconnectLifecycle.cancelParticipantRemoval(tokenBinding.participantId);
+
+      const previousEndpoint = await sessionMapping.getParticipantEndpoint(tokenBinding.participantId);
+      if (previousEndpoint) {
+        await sessionMapping.unbindSocketSession(previousEndpoint.transportSocketId);
+        evictSocketFromRoom(previousEndpoint.transportSocketId, tokenBinding.roomId, 'ANON_TOKEN_TRANSFER');
+      }
+
+      const previousLeaveResult = await orchestration.leaveParticipant(
+        tokenBinding.roomId,
+        tokenBinding.participantId
+      );
+      await anonymousAuthRegistry.unbindParticipant(tokenBinding.participantId);
+
+      if (previousLeaveResult) {
+        await roomBroadcaster.emitToRoom(previousLeaveResult.roomId, 'participant:left', {
+          participantId: previousLeaveResult.participantId,
+          participants: previousLeaveResult.participants,
+          message: previousLeaveResult.message
+        });
+      }
+    }
+
     const joinResult = await orchestration.joinParticipant({
       socketId: socket.id,
       roomId,
       displayName,
       reconnectIdentity
     });
+    console.log('[room] join attempt accepted', {
+      joinAttemptId,
+      roomId,
+      socketId: socket.id,
+      participantId: joinResult.participant.id,
+      rejoin: joinResult.isRejoin
+    });
     const participant = joinResult.participant;
+    await anonymousAuthRegistry.bindTokenToParticipant(anonymousAuthToken, {
+      roomId,
+      participantId: participant.id
+    });
     const nextSessionToken = sessionTokenService.issue({
       roomId,
       participantId: participant.id
@@ -144,27 +225,30 @@ export const attachRoomLifecycleHandlers = ({
 
   socket.on('room:leave', async (ack?: () => void) => {
     isExplicitLeaveInProgress = true;
-    const session = await sessionMapping.unbindSocketSession(socket.id);
-    if (!session) {
+    try {
+      const session = await sessionMapping.unbindSocketSession(socket.id);
+      if (!session) {
+        return;
+      }
+
+      socket.leave(session.roomId);
+      const leaveResult = await orchestration.leaveParticipant(session.roomId, session.participantId);
+      if (!leaveResult) {
+        return;
+      }
+
+      await reconnectLifecycle.cancelParticipantRemoval(leaveResult.participantId);
+      await anonymousAuthRegistry.unbindParticipant(leaveResult.participantId);
+
+      await roomBroadcaster.emitToRoomExcept(leaveResult.roomId, socket.id, 'participant:left', {
+        participantId: leaveResult.participantId,
+        participants: leaveResult.participants,
+        message: leaveResult.message
+      });
+    } finally {
+      isExplicitLeaveInProgress = false;
       ack?.();
-      return;
     }
-
-    socket.leave(session.roomId);
-    const leaveResult = await orchestration.leaveParticipant(session.roomId, session.participantId);
-    if (!leaveResult) {
-      ack?.();
-      return;
-    }
-
-    await reconnectLifecycle.cancelParticipantRemoval(leaveResult.participantId);
-
-    await roomBroadcaster.emitToRoomExcept(leaveResult.roomId, socket.id, 'participant:left', {
-      participantId: leaveResult.participantId,
-      participants: leaveResult.participants,
-      message: leaveResult.message
-    });
-    ack?.();
   });
 
   socket.on('disconnect', async (reason) => {
@@ -183,6 +267,7 @@ export const attachRoomLifecycleHandlers = ({
       if (!leaveResult) {
         return;
       }
+      await anonymousAuthRegistry.unbindParticipant(leaveResult.participantId);
 
       await roomBroadcaster.emitToRoomExcept(leaveResult.roomId, socket.id, 'participant:left', {
         participantId: leaveResult.participantId,
@@ -222,6 +307,7 @@ export const attachRoomLifecycleHandlers = ({
     if (!leaveResult) {
       return;
     }
+    await anonymousAuthRegistry.unbindParticipant(leaveResult.participantId);
 
     await roomBroadcaster.emitToRoom(leaveResult.roomId, 'participant:left', {
       participantId: leaveResult.participantId,

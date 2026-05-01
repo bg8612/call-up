@@ -4,6 +4,7 @@ import { createExpressApp } from './bootstrap/express-app.js';
 import { createServerConfig } from './config.js';
 import { createRoomState } from './domain/room-state.js';
 import { createBackendMetrics } from './services/backend-metrics.js';
+import { createAnonymousAuthRegistry } from './services/anonymous-auth-registry.js';
 import { createClientSessionMapping } from './services/client-session-mapping.js';
 import { createParticipantSessionTokenService } from './services/participant-session-token.js';
 import { createReconnectLifecycle } from './services/reconnect-lifecycle.js';
@@ -105,6 +106,7 @@ export const createAppServer = () => {
     participantEndpointStore: createInMemoryParticipantEndpointStore()
   });
   const roomBroadcaster = createLocalRoomBroadcaster({ io });
+  const anonymousAuthRegistry = createAnonymousAuthRegistry();
   const clientSessionMapping = createClientSessionMapping({
     clientSessionStore: createInMemoryClientSessionStore()
   });
@@ -123,12 +125,20 @@ export const createAppServer = () => {
     maxTimers: config.maxReconnectTimers,
     timerStore: createInMemoryReconnectTimerStore(),
     onParticipantGraceExpired: async ({ roomId, participantId, participantName }) => {
+      console.log('[reconnect] grace finalization start', {
+        roomId,
+        participantId
+      });
       const leaveResult = await orchestration.finalizeReconnectingParticipantLeave(
         roomId,
         participantId,
         participantName
       );
       if (!leaveResult) {
+        console.log('[reconnect] grace finalization skipped', {
+          roomId,
+          participantId
+        });
         return;
       }
 
@@ -136,6 +146,11 @@ export const createAppServer = () => {
         participantId: leaveResult.participantId,
         participants: leaveResult.participants,
         message: leaveResult.message
+      });
+      await anonymousAuthRegistry.unbindParticipant(leaveResult.participantId);
+      console.log('[reconnect] grace finalization completed', {
+        roomId: leaveResult.roomId,
+        participantId: leaveResult.participantId
       });
     }
   });
@@ -150,6 +165,7 @@ export const createAppServer = () => {
     signalingDelivery,
     reconnectLifecycle,
     metrics,
+    anonymousAuthRegistry,
     socketTrafficConfig: {
       maxInFlight: config.maxInflightEventsPerSocket,
       signalMaxBytes: config.signalMaxBytes,

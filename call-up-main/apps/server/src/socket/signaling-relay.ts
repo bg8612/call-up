@@ -58,6 +58,7 @@ export const attachSignalingRelay = ({
 
       const session = await sessionMapping.getSocketSession(socket.id);
       if (!session) {
+        console.warn('[signal] dropped event without active socket session', { socketId: socket.id });
         return;
       }
 
@@ -77,6 +78,19 @@ export const attachSignalingRelay = ({
       });
       if (!deliveryResult.delivered) {
         metrics.increment('deliveryFailures');
+        console.warn('[signal] delivery failed', {
+          roomId: session.roomId,
+          fromParticipantId: relay.fromParticipantId,
+          toParticipantId: relay.targetParticipantId,
+          reason: deliveryResult.reason
+        });
+      } else {
+        console.log('[signal] delivered', {
+          roomId: session.roomId,
+          fromParticipantId: relay.fromParticipantId,
+          toParticipantId: relay.targetParticipantId,
+          signalType: relay.signal.type
+        });
       }
     } finally {
       gate.release();

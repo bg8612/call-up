@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { signalSchema, speakingStateSchema } from './protocol.js';
+import { mediaStateSchema, signalSchema, speakingStateSchema } from './protocol.js';
 
 describe('signalSchema', () => {
   it('accepts valid offer/answer/candidate payloads', () => {
@@ -78,5 +78,32 @@ describe('speakingStateSchema', () => {
     expect(speakingStateSchema.safeParse({ isSpeaking: true }).success).toBe(true);
     expect(speakingStateSchema.safeParse({ isSpeaking: false }).success).toBe(true);
     expect(speakingStateSchema.safeParse({ isSpeaking: 'yes' }).success).toBe(false);
+  });
+});
+
+describe('mediaStateSchema', () => {
+  it('requires cameraStreamId when camera or microphone is enabled', () => {
+    expect(mediaStateSchema.safeParse({ isMicOn: true }).success).toBe(false);
+    expect(mediaStateSchema.safeParse({ isCameraOn: true }).success).toBe(false);
+
+    expect(
+      mediaStateSchema.safeParse({
+        isMicOn: true,
+        cameraStreamId: 'camera-stream-1'
+      }).success
+    ).toBe(true);
+  });
+
+  it('requires screenStreamId when screen share video/audio is enabled', () => {
+    expect(mediaStateSchema.safeParse({ isScreenSharing: true }).success).toBe(false);
+    expect(mediaStateSchema.safeParse({ isSharingAudio: true }).success).toBe(false);
+
+    expect(
+      mediaStateSchema.safeParse({
+        isScreenSharing: true,
+        isSharingAudio: true,
+        screenStreamId: 'screen-stream-1'
+      }).success
+    ).toBe(true);
   });
 });

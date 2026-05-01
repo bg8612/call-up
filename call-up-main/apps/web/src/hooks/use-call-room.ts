@@ -16,12 +16,32 @@ import type {
   RoomPolicy,
   WireParticipant
 } from '../features/call/types';
+import {
+  DEFAULT_SCREEN_SHARE_PRESET_ID,
+  SCREEN_SHARE_PRESETS,
+  type ScreenSharePresetId,
+  getScreenSharePreset,
+  isScreenSharePresetSatisfiedBySettings,
+  toDisplayVideoConstraints
+} from '../features/call/screen-share-quality';
+import { pickAvailableDeviceId, resolveAudioInputWarning } from '../features/call/device-selection';
+import {
+  canApplyCandidateOrAnswer,
+  hasLiveTrackByKind,
+  isPeerOperationStale,
+  mergeIncomingRemoteTrack,
+  pruneRemoteMediaState,
+  reconcileRemoteMediaBuckets,
+  shouldRunRecoveryTimer,
+  shouldScheduleMediaRecovery
+} from './peer-stability';
 
 type JoinForm = {
   roomId: string;
   displayName: string;
   clientSessionId: string;
   sessionToken?: string;
+  anonymousAuthToken?: string;
 };
 
 type JoinAck =
@@ -50,6 +70,7 @@ type SignalPayload =
 
 type PeerRecord = {
   pc: RTCPeerConnection;
+  version: number;
   polite: boolean;
   makingOffer: boolean;
   ignoreOffer: boolean;
@@ -61,6 +82,11 @@ type PeerRecord = {
     screenVideo?: RTCRtpSender;
     screenAudio?: RTCRtpSender;
   };
+};
+
+type RecoveryTimerEntry = {
+  timer: number;
+  version: number;
 };
 
 type SpeakingMonitorCleanup = () => void;
@@ -137,19 +163,46 @@ const resolveServerUrl = () => {
 
 const serverUrl = resolveServerUrl();
 
-const SPEAKING_THRESHOLD = 0.045;
+const SPEAKING_ENTER_THRESHOLD = 0.05;
+const SPEAKING_LEAVE_THRESHOLD = 0.035;
 const SPEAKING_ENTER_MS = 45;
-const SPEAKING_LEAVE_MS = 180;
+const SPEAKING_LEAVE_MS = 360;
 const ANALYSER_FFT_SIZE = 512;
 const ANALYSER_SMOOTHING = 0.62;
-const JOIN_ACK_TIMEOUT_MS = 8_000;
+const JOIN_ACK_TIMEOUT_MS = 6_000;
+const SOCKET_CONNECT_TIMEOUT_MS = 12_000;
+const INITIAL_JOIN_MAX_WAIT_MS = 18_000;
 const CAMERA_MAX_BITRATE = 1_500_000;
 const PEER_RECOVERY_DELAY_MS = 1_500;
 const MEDIA_RECOVERY_GRACE_MS = 3_500;
 const SPEAKING_SYNC_MIN_INTERVAL_MS = 250;
+const ANONYMOUS_AUTH_TOKEN_STORAGE_KEY = 'callup:anonymous-auth-token';
 
 const cloneRemoteMap = (source: Map<string, RemoteMediaState>) =>
   new Map([...source.entries()].map(([key, value]) => [key, { ...value }]));
+
+const generateAnonymousAuthToken = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `anon_${crypto.randomUUID()}`;
+  }
+
+  return `anon_${Math.random().toString(36).slice(2, 12)}${Date.now().toString(36)}`;
+};
+
+const ensureAnonymousAuthToken = () => {
+  if (typeof window === 'undefined') {
+    return generateAnonymousAuthToken();
+  }
+
+  const existing = window.localStorage.getItem(ANONYMOUS_AUTH_TOKEN_STORAGE_KEY)?.trim();
+  if (existing) {
+    return existing;
+  }
+
+  const nextToken = generateAnonymousAuthToken();
+  window.localStorage.setItem(ANONYMOUS_AUTH_TOKEN_STORAGE_KEY, nextToken);
+  return nextToken;
+};
 
 const createSpeakingMonitor = (
   stream: MediaStream,
@@ -201,7 +254,7 @@ const createSpeakingMonitor = (
     const rms = Math.sqrt(sum / data.length);
     const now = performance.now();
 
-    if (rms > SPEAKING_THRESHOLD) {
+    if (rms > SPEAKING_ENTER_THRESHOLD) {
       aboveThresholdSince = aboveThresholdSince || now;
       belowThresholdSince = 0;
       if (!speaking && now - aboveThresholdSince >= SPEAKING_ENTER_MS) {
@@ -209,11 +262,13 @@ const createSpeakingMonitor = (
         onSpeakingChange(true);
       }
     } else {
-      belowThresholdSince = belowThresholdSince || now;
-      aboveThresholdSince = 0;
-      if (speaking && now - belowThresholdSince >= SPEAKING_LEAVE_MS) {
-        speaking = false;
-        onSpeakingChange(false);
+      if (rms < SPEAKING_LEAVE_THRESHOLD) {
+        belowThresholdSince = belowThresholdSince || now;
+        aboveThresholdSince = 0;
+        if (speaking && now - belowThresholdSince >= SPEAKING_LEAVE_MS) {
+          speaking = false;
+          onSpeakingChange(false);
+        }
       }
     }
 
@@ -240,6 +295,8 @@ export const useCallRoom = () => {
   const [selectedAudioInputId, setSelectedAudioInputId] = useState<string>('');
   const [selectedAudioOutputId, setSelectedAudioOutputId] = useState<string>('');
   const [selectedVideoInputId, setSelectedVideoInputId] = useState<string>('');
+  const [selectedScreenSharePresetId, setSelectedScreenSharePresetId] =
+    useState<ScreenSharePresetId>(DEFAULT_SCREEN_SHARE_PRESET_ID);
   const [localMediaStream, setLocalMediaStream] = useState<MediaStream | null>(null);
   const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, RemoteMediaState>>(new Map());
@@ -249,8 +306,9 @@ export const useCallRoom = () => {
   const [resolvedSessionToken, setResolvedSessionToken] = useState('');
   const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, PeerRecord>>(new Map());
-  const peerRecoveryTimersRef = useRef<Map<string, number>>(new Map());
-  const mediaRecoveryTimersRef = useRef<Map<string, number>>(new Map());
+  const peerRecoveryTimersRef = useRef<Map<string, RecoveryTimerEntry>>(new Map());
+  const mediaRecoveryTimersRef = useRef<Map<string, RecoveryTimerEntry>>(new Map());
+  const peerVersionsRef = useRef<Map<string, number>>(new Map());
   const remoteStreamsRef = useRef<Map<string, RemoteMediaState>>(new Map());
   const localParticipantIdRef = useRef<string>('');
   const localMediaStreamRef = useRef<MediaStream | null>(null);
@@ -259,10 +317,16 @@ export const useCallRoom = () => {
   const speakingMonitorsRef = useRef<Map<string, SpeakingMonitorCleanup>>(new Map());
   const speakingSourcesRef = useRef<Record<SpeakingSource, boolean>>({ camera: false, screen: false });
   const speakingSyncRef = useRef<{ value: boolean; sentAt: number }>({ value: false, sentAt: 0 });
+  const selectedScreenSharePresetIdRef = useRef<ScreenSharePresetId>(DEFAULT_SCREEN_SHARE_PRESET_ID);
   const localPreviewModeRef = useRef(false);
   const activeJoinSessionRef = useRef<JoinForm | null>(null);
   const joinAckTimerRef = useRef<number | null>(null);
+  const initialJoinTimerRef = useRef<number | null>(null);
   const hasJoinedRoomRef = useRef(false);
+  const leaveOperationIdRef = useRef(0);
+  const joinAttemptCounterRef = useRef(0);
+  const preJoinConnectErrorsRef = useRef(0);
+  const signalSequenceRef = useRef(0);
   const negotiatePeerConnectionRef = useRef<(participantId: string, iceRestart?: boolean) => Promise<void>>(
     async () => undefined
   );
@@ -273,6 +337,10 @@ export const useCallRoom = () => {
   useEffect(() => {
     callStateRef.current = callState;
   }, [callState]);
+
+  useEffect(() => {
+    selectedScreenSharePresetIdRef.current = selectedScreenSharePresetId;
+  }, [selectedScreenSharePresetId]);
 
   const localParticipant = useMemo(
     () => callState.participants.find((participant) => participant.id === localParticipantIdRef.current) ?? null,
@@ -303,6 +371,15 @@ export const useCallRoom = () => {
     joinAckTimerRef.current = null;
   }, []);
 
+  const clearInitialJoinTimer = useCallback(() => {
+    if (initialJoinTimerRef.current === null) {
+      return;
+    }
+
+    window.clearTimeout(initialJoinTimerRef.current);
+    initialJoinTimerRef.current = null;
+  }, []);
+
   const updateParticipantConnectionState = useCallback((participantId: string, connectionState: Participant['connectionState']) => {
     const participant = callStateRef.current.participants.find((item) => item.id === participantId);
     if (!participant) {
@@ -319,31 +396,39 @@ export const useCallRoom = () => {
   }, []);
 
   const clearPeerRecovery = useCallback((participantId: string) => {
-    const timer = peerRecoveryTimersRef.current.get(participantId);
-    if (timer === undefined) {
+    const timerEntry = peerRecoveryTimersRef.current.get(participantId);
+    if (!timerEntry) {
       return;
     }
 
-    window.clearTimeout(timer);
+    window.clearTimeout(timerEntry.timer);
     peerRecoveryTimersRef.current.delete(participantId);
   }, []);
 
   const clearMediaRecovery = useCallback((participantId: string) => {
-    const timer = mediaRecoveryTimersRef.current.get(participantId);
-    if (timer === undefined) {
+    const timerEntry = mediaRecoveryTimersRef.current.get(participantId);
+    if (!timerEntry) {
       return;
     }
 
-    window.clearTimeout(timer);
+    window.clearTimeout(timerEntry.timer);
     mediaRecoveryTimersRef.current.delete(participantId);
   }, []);
 
+  const getPeerVersion = useCallback((participantId: string) => peerVersionsRef.current.get(participantId) ?? 0, []);
+
+  const allocatePeerVersion = useCallback((participantId: string) => {
+    const nextVersion = getPeerVersion(participantId) + 1;
+    peerVersionsRef.current.set(participantId, nextVersion);
+    return nextVersion;
+  }, [getPeerVersion]);
+
   const hasExpectedRemoteMedia = useCallback((participantId: string, participant: Participant) => {
     const media = remoteStreamsRef.current.get(participantId);
-    const hasCameraTrack = Boolean(getTrackByKind(media?.cameraStream ?? null, 'video'));
-    const hasMicTrack = Boolean(getTrackByKind(media?.cameraStream ?? null, 'audio'));
-    const hasScreenTrack = Boolean(getTrackByKind(media?.screenStream ?? null, 'video'));
-    const hasScreenAudio = Boolean(getTrackByKind(media?.screenStream ?? null, 'audio'));
+    const hasCameraTrack = hasLiveTrackByKind(media?.cameraStream, 'video');
+    const hasMicTrack = hasLiveTrackByKind(media?.cameraStream, 'audio');
+    const hasScreenTrack = hasLiveTrackByKind(media?.screenStream, 'video');
+    const hasScreenAudio = hasLiveTrackByKind(media?.screenStream, 'audio');
 
     const cameraSatisfied = !participant.isCameraOn || hasCameraTrack;
     const micSatisfied = !participant.isMicOn || hasMicTrack;
@@ -354,32 +439,53 @@ export const useCallRoom = () => {
 
   const ensureRemoteMediaRecovery = useCallback(
     (participant: Participant) => {
-      if (
-        participant.id === localParticipantIdRef.current ||
-        participant.connectionState !== 'connected'
-      ) {
-        clearMediaRecovery(participant.id);
-        return;
-      }
-
       const expectsAnyMedia = participant.isCameraOn || participant.isMicOn || participant.isScreenSharing || participant.isSharingAudio;
-      if (!expectsAnyMedia || hasExpectedRemoteMedia(participant.id, participant)) {
+      const hasTimer = mediaRecoveryTimersRef.current.has(participant.id);
+      const shouldSchedule = shouldScheduleMediaRecovery({
+        participantConnectionState: participant.connectionState,
+        isLocalParticipant: participant.id === localParticipantIdRef.current,
+        hasAnyExpectedMedia: expectsAnyMedia,
+        alreadyScheduled: hasTimer,
+        hasExpectedRemoteMedia: hasExpectedRemoteMedia(participant.id, participant)
+      });
+      if (!shouldSchedule) {
         clearMediaRecovery(participant.id);
         return;
       }
 
-      if (mediaRecoveryTimersRef.current.has(participant.id)) {
-        return;
-      }
-
+      const expectedVersion = getPeerVersion(participant.id);
       const timer = window.setTimeout(() => {
+        const current = mediaRecoveryTimersRef.current.get(participant.id);
         mediaRecoveryTimersRef.current.delete(participant.id);
+        if (
+          !current ||
+          !shouldRunRecoveryTimer({
+            timerVersion: current.version,
+            currentVersion: expectedVersion
+          })
+        ) {
+          console.log('[rtc] media recovery timer ignored stale version', {
+            participantId: participant.id,
+            expectedVersion,
+            currentVersion: current?.version
+          });
+          return;
+        }
+        console.log('[rtc] media recovery timer fired', { participantId: participant.id, peerVersion: expectedVersion });
         void recoverPeerConnectionRef.current(participant.id, true);
       }, MEDIA_RECOVERY_GRACE_MS);
 
-      mediaRecoveryTimersRef.current.set(participant.id, timer);
+      mediaRecoveryTimersRef.current.set(participant.id, {
+        timer,
+        version: expectedVersion
+      });
+      console.log('[rtc] media recovery timer scheduled', {
+        participantId: participant.id,
+        peerVersion: expectedVersion,
+        delayMs: MEDIA_RECOVERY_GRACE_MS
+      });
     },
-    [clearMediaRecovery, hasExpectedRemoteMedia]
+    [clearMediaRecovery, getPeerVersion, hasExpectedRemoteMedia]
   );
 
   const schedulePeerRecovery = useCallback(
@@ -388,34 +494,67 @@ export const useCallRoom = () => {
         return;
       }
 
+      const expectedVersion = getPeerVersion(participantId);
       const timer = window.setTimeout(() => {
+        const current = peerRecoveryTimersRef.current.get(participantId);
         peerRecoveryTimersRef.current.delete(participantId);
+        if (
+          !current ||
+          !shouldRunRecoveryTimer({
+            timerVersion: current.version,
+            currentVersion: expectedVersion
+          })
+        ) {
+          console.log('[rtc] peer recovery timer ignored stale version', {
+            participantId,
+            expectedVersion,
+            currentVersion: current?.version
+          });
+          return;
+        }
+        console.log('[rtc] peer recovery timer fired', { participantId, peerVersion: expectedVersion });
         void recoverPeerConnectionRef.current(participantId, iceRestart);
       }, PEER_RECOVERY_DELAY_MS);
 
-      peerRecoveryTimersRef.current.set(participantId, timer);
+      peerRecoveryTimersRef.current.set(participantId, {
+        timer,
+        version: expectedVersion
+      });
+      console.log('[rtc] peer recovery timer scheduled', {
+        participantId,
+        peerVersion: expectedVersion,
+        delayMs: PEER_RECOVERY_DELAY_MS
+      });
     },
-    []
+    [getPeerVersion]
   );
 
   const configureSenderParameters = useCallback(
     async (sender: RTCRtpSender | undefined, senderKey: keyof PeerRecord['senders']) => {
-      if (!sender || senderKey !== 'cameraVideo' || typeof sender.getParameters !== 'function') {
+      if (
+        !sender ||
+        (senderKey !== 'cameraVideo' && senderKey !== 'screenVideo') ||
+        typeof sender.getParameters !== 'function'
+      ) {
         return;
       }
 
       const parameters = sender.getParameters();
       parameters.degradationPreference = 'balanced';
       parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
+      const maxBitrate =
+        senderKey === 'cameraVideo'
+          ? CAMERA_MAX_BITRATE
+          : getScreenSharePreset(selectedScreenSharePresetIdRef.current).maxBitrate;
       parameters.encodings[0] = {
         ...parameters.encodings[0],
-        maxBitrate: CAMERA_MAX_BITRATE
+        maxBitrate
       };
 
       try {
         await sender.setParameters(parameters);
       } catch (error) {
-        console.warn('Failed to configure camera sender parameters', error);
+        console.warn('Failed to configure sender parameters', { senderKey, error });
       }
     },
     []
@@ -434,9 +573,33 @@ export const useCallRoom = () => {
     };
 
     setDevices(nextDevices);
-    setSelectedAudioInputId((current) => current || nextDevices.audioInputs[0]?.deviceId || '');
-    setSelectedAudioOutputId((current) => current || nextDevices.audioOutputs[0]?.deviceId || '');
-    setSelectedVideoInputId((current) => current || nextDevices.videoInputs[0]?.deviceId || '');
+
+    setSelectedAudioInputId((current) => {
+      const picked = pickAvailableDeviceId(
+        current,
+        nextDevices.audioInputs.map((device) => device.deviceId)
+      );
+      if (picked.changed && picked.deviceId !== current) {
+        console.warn('[media] selected audio input is unavailable, fallback applied', {
+          previousDeviceId: current,
+          fallbackDeviceId: picked.deviceId || '(none)'
+        });
+      }
+      return picked.deviceId;
+    });
+    setSelectedAudioOutputId((current) => {
+      if (!current) {
+        return '';
+      }
+
+      return nextDevices.audioOutputs.some((device) => device.deviceId === current) ? current : '';
+    });
+    setSelectedVideoInputId((current) => {
+      return pickAvailableDeviceId(
+        current,
+        nextDevices.videoInputs.map((device) => device.deviceId)
+      ).deviceId;
+    });
   }, []);
 
   const getOrCreateLocalMediaStream = useCallback(() => {
@@ -453,13 +616,17 @@ export const useCallRoom = () => {
     const cameraVideoTrack = getTrackByKind(cameraStream, 'video');
     const cameraAudioTrack = getTrackByKind(cameraStream, 'audio');
     const screenAudioTrack = getTrackByKind(screenStream, 'audio');
+    const hasLiveTrack = (track: MediaStreamTrack | null | undefined) =>
+      Boolean(track && track.readyState === 'live' && track.enabled);
+    const hasLiveVideoTrack = (track: MediaStreamTrack | null | undefined) =>
+      Boolean(track && track.readyState === 'live');
     const mediaState = {
-      isCameraOn: Boolean(cameraVideoTrack?.enabled),
-      isMicOn: Boolean(cameraAudioTrack?.enabled),
-      isScreenSharing: Boolean(getTrackByKind(screenStream, 'video')),
-      isSharingAudio: Boolean(screenAudioTrack?.enabled),
-      cameraStreamId: cameraStream?.id,
-      screenStreamId: screenStream?.id
+      isCameraOn: hasLiveTrack(cameraVideoTrack),
+      isMicOn: hasLiveTrack(cameraAudioTrack),
+      isScreenSharing: hasLiveVideoTrack(getTrackByKind(screenStream, 'video')),
+      isSharingAudio: hasLiveTrack(screenAudioTrack),
+      cameraStreamId: hasLiveVideoTrack(cameraVideoTrack) || hasLiveTrack(cameraAudioTrack) ? cameraStream?.id : undefined,
+      screenStreamId: hasLiveVideoTrack(getTrackByKind(screenStream, 'video')) || hasLiveTrack(screenAudioTrack) ? screenStream?.id : undefined
     };
 
     if (localParticipantIdRef.current) {
@@ -499,17 +666,49 @@ export const useCallRoom = () => {
     });
   }, []);
 
-  const ensurePeerRecord = useCallback(
-    (remoteParticipantId: string) => {
-      const existing = peersRef.current.get(remoteParticipantId);
+  const disposeParticipantPeer = useCallback(
+    (participantId: string, reason: string, removeRemoteState = true) => {
+      clearPeerRecovery(participantId);
+      clearMediaRecovery(participantId);
+
+      const existing = peersRef.current.get(participantId);
       if (existing) {
+        existing.pendingIceCandidates = [];
+        existing.pc.close();
+        peersRef.current.delete(participantId);
+        console.log('[rtc] peer disposed', {
+          participantId,
+          peerVersion: existing.version,
+          reason
+        });
+      }
+
+      if (removeRemoteState) {
+        updateRemoteStreams((draft) => {
+          draft.delete(participantId);
+        });
+      }
+    },
+    [clearMediaRecovery, clearPeerRecovery, updateRemoteStreams]
+  );
+
+  const ensurePeerRecord = useCallback(
+    (remoteParticipantId: string, forceRecreate = false) => {
+      const existing = peersRef.current.get(remoteParticipantId);
+      if (existing && !forceRecreate) {
         return existing;
       }
 
+      if (existing && forceRecreate) {
+        disposeParticipantPeer(remoteParticipantId, 'force-recreate', false);
+      }
+
+      const version = allocatePeerVersion(remoteParticipantId);
       const polite = localParticipantIdRef.current.localeCompare(remoteParticipantId) > 0;
       const pc = new RTCPeerConnection(rtcConfig);
       const peerRecord: PeerRecord = {
         pc,
+        version,
         polite,
         makingOffer: false,
         ignoreOffer: false,
@@ -519,6 +718,9 @@ export const useCallRoom = () => {
       };
 
       pc.onicecandidate = (event) => {
+        if (peerRecord.version !== getPeerVersion(remoteParticipantId) || String(pc.connectionState) === 'closed') {
+          return;
+        }
         if (!event.candidate) {
           return;
         }
@@ -533,8 +735,12 @@ export const useCallRoom = () => {
       };
 
       pc.onconnectionstatechange = () => {
+        if (peerRecord.version !== getPeerVersion(remoteParticipantId)) {
+          return;
+        }
         if (pc.connectionState === 'connected') {
           clearPeerRecovery(remoteParticipantId);
+          console.log('[rtc] peer connected', { participantId: remoteParticipantId, peerVersion: peerRecord.version });
           return;
         }
 
@@ -548,37 +754,98 @@ export const useCallRoom = () => {
           return;
         }
 
-        if (pc.connectionState === 'closed') {
+        if (String(pc.connectionState) === 'closed') {
           clearPeerRecovery(remoteParticipantId);
         }
+        console.log('[rtc] peer connection state changed', {
+          participantId: remoteParticipantId,
+          peerVersion: peerRecord.version,
+          state: pc.connectionState
+        });
       };
 
       pc.ontrack = (event) => {
-        const stream = event.streams[0];
+        if (peerRecord.version !== getPeerVersion(remoteParticipantId) || String(pc.connectionState) === 'closed') {
+          return;
+        }
         const participant = callStateRef.current.participants.find((item) => item.id === remoteParticipantId);
-        const isScreenStream = participant?.screenStreamId ? participant.screenStreamId === stream.id : false;
-        const bucket: keyof RemoteMediaState = isScreenStream ? 'screenStream' : 'cameraStream';
+        if (!participant) {
+          return;
+        }
+        const incomingStream = event.streams[0];
+
+        console.log('[rtc] remote track received', {
+          participantId: remoteParticipantId,
+          peerVersion: peerRecord.version,
+          trackKind: event.track.kind,
+          trackId: event.track.id,
+          streamCount: event.streams.length,
+          streamId: incomingStream?.id
+        });
 
         updateRemoteStreams((draft) => {
           const current = draft.get(remoteParticipantId) ?? {};
-          current[bucket] = stream;
-          draft.set(remoteParticipantId, current);
+          const next = mergeIncomingRemoteTrack({
+            current,
+            participant,
+            track: event.track,
+            incomingStream
+          });
+          const pruned = pruneRemoteMediaState(next);
+          if (!pruned.cameraStream && !pruned.screenStream) {
+            draft.delete(remoteParticipantId);
+            return;
+          }
+          draft.set(remoteParticipantId, pruned);
         });
 
-        const currentParticipant = callStateRef.current.participants.find((item) => item.id === remoteParticipantId);
-        if (currentParticipant) {
+        const handleRemoteTrackStateChange = () => {
+          const currentParticipant = callStateRef.current.participants.find((item) => item.id === remoteParticipantId);
+          if (!currentParticipant) {
+            return;
+          }
+
+          updateRemoteStreams((draft) => {
+            const current = draft.get(remoteParticipantId);
+            if (!current) {
+              return;
+            }
+            const pruned = pruneRemoteMediaState(current);
+            if (!pruned.cameraStream && !pruned.screenStream) {
+              draft.delete(remoteParticipantId);
+              return;
+            }
+            draft.set(remoteParticipantId, pruned);
+          });
           ensureRemoteMediaRecovery(currentParticipant);
-        }
+        };
+        event.track.addEventListener('ended', handleRemoteTrackStateChange);
+        event.track.addEventListener('mute', handleRemoteTrackStateChange);
+        event.track.addEventListener('unmute', handleRemoteTrackStateChange);
+
+        ensureRemoteMediaRecovery(participant);
       };
 
       pc.onnegotiationneeded = async () => {
+        if (peerRecord.version !== getPeerVersion(remoteParticipantId) || String(pc.connectionState) === 'closed') {
+          return;
+        }
         await negotiatePeerConnectionRef.current(remoteParticipantId);
       };
 
+      console.log('[rtc] peer created', { participantId: remoteParticipantId, peerVersion: version });
       peersRef.current.set(remoteParticipantId, peerRecord);
       return peerRecord;
     },
-    [clearPeerRecovery, ensureRemoteMediaRecovery, schedulePeerRecovery, updateRemoteStreams]
+    [
+      allocatePeerVersion,
+      clearPeerRecovery,
+      disposeParticipantPeer,
+      ensureRemoteMediaRecovery,
+      getPeerVersion,
+      schedulePeerRecovery,
+      updateRemoteStreams
+    ]
   );
 
   const syncPeerTracks = useCallback(
@@ -636,13 +903,30 @@ export const useCallRoom = () => {
   const negotiatePeerConnection = useCallback(
     async (remoteParticipantId: string, iceRestart = false) => {
       const peer = ensurePeerRecord(remoteParticipantId);
+      const expectedVersion = peer.version;
       if (peer.makingOffer || peer.pc.signalingState !== 'stable') {
         return;
       }
 
       try {
         peer.makingOffer = true;
+        const negotiationAttemptId = `${remoteParticipantId}:v${expectedVersion}:${Date.now()}`;
+        console.log('[rtc] negotiation start', {
+          negotiationAttemptId,
+          participantId: remoteParticipantId,
+          peerVersion: expectedVersion,
+          iceRestart
+        });
         await syncPeerTracks(remoteParticipantId);
+        const currentPeer = peersRef.current.get(remoteParticipantId);
+        if (!currentPeer || currentPeer.version !== expectedVersion || String(currentPeer.pc.connectionState) === 'closed') {
+          console.log('[rtc] negotiation skipped stale peer', {
+            negotiationAttemptId,
+            participantId: remoteParticipantId,
+            peerVersion: expectedVersion
+          });
+          return;
+        }
         const offer = await peer.pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
         await peer.pc.setLocalDescription(offer);
 
@@ -655,10 +939,18 @@ export const useCallRoom = () => {
             }
           });
         }
+        console.log('[rtc] negotiation completed', {
+          negotiationAttemptId,
+          participantId: remoteParticipantId,
+          peerVersion: expectedVersion
+        });
       } catch (error) {
         console.error('Negotiation failed', error);
       } finally {
-        peer.makingOffer = false;
+        const currentPeer = peersRef.current.get(remoteParticipantId);
+        if (currentPeer?.version === expectedVersion) {
+          currentPeer.makingOffer = false;
+        }
       }
     },
     [ensurePeerRecord, syncPeerTracks]
@@ -680,31 +972,38 @@ export const useCallRoom = () => {
       }
 
       if (iceRestart && existing && existing.pc.signalingState === 'stable') {
+        console.log('[rtc] peer recovery ice restart', {
+          participantId: remoteParticipantId,
+          peerVersion: existing.version
+        });
         await negotiatePeerConnection(remoteParticipantId, true);
         return;
       }
 
-      existing?.pc.close();
-      peersRef.current.delete(remoteParticipantId);
-      clearPeerRecovery(remoteParticipantId);
-      ensurePeerRecord(remoteParticipantId);
+      if (existing) {
+        disposeParticipantPeer(remoteParticipantId, 'recovery-recreate', false);
+      } else {
+        clearPeerRecovery(remoteParticipantId);
+      }
+      ensurePeerRecord(remoteParticipantId, true);
       await negotiatePeerConnection(remoteParticipantId, false);
     },
-    [clearPeerRecovery, ensurePeerRecord, negotiatePeerConnection]
+    [clearPeerRecovery, disposeParticipantPeer, ensurePeerRecord, negotiatePeerConnection]
   );
 
   recoverPeerConnectionRef.current = recoverPeerConnection;
 
   const closeAllPeers = useCallback(() => {
-    peersRef.current.forEach((peer) => peer.pc.close());
-    peersRef.current.clear();
-    peerRecoveryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    Array.from(peersRef.current.keys()).forEach((participantId) => {
+      disposeParticipantPeer(participantId, 'close-all-peers');
+    });
+    peerRecoveryTimersRef.current.forEach(({ timer }) => window.clearTimeout(timer));
+    mediaRecoveryTimersRef.current.forEach(({ timer }) => window.clearTimeout(timer));
     peerRecoveryTimersRef.current.clear();
-    mediaRecoveryTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     mediaRecoveryTimersRef.current.clear();
     remoteStreamsRef.current = new Map();
     setRemoteStreams(new Map());
-  }, []);
+  }, [disposeParticipantPeer]);
 
   const stopAllTracks = useCallback((stream: MediaStream | null) => {
     stream?.getTracks().forEach((track) => track.stop());
@@ -818,20 +1117,43 @@ export const useCallRoom = () => {
     async (kind: 'audio' | 'video', deviceId?: string, enabled = true) => {
       setIsConnectingMedia(true);
       try {
-        const constraints =
+        const buildConstraints = (targetDeviceId?: string) =>
           kind === 'audio'
-            ? { audio: deviceId ? { deviceId: { exact: deviceId } } : true, video: false }
+            ? { audio: targetDeviceId ? { deviceId: { exact: targetDeviceId } } : true, video: false }
             : {
                 audio: false,
                 video: {
-                  deviceId: deviceId ? { exact: deviceId } : undefined,
+                  deviceId: targetDeviceId ? { exact: targetDeviceId } : undefined,
                   width: { ideal: 1280 },
                   height: { ideal: 720 },
                   frameRate: { ideal: 24, max: 30 }
                 }
               };
 
-        const requested = await navigator.mediaDevices.getUserMedia(constraints);
+        let requested: MediaStream;
+        let usedFallbackDevice = false;
+        try {
+          requested = await navigator.mediaDevices.getUserMedia(buildConstraints(deviceId));
+        } catch (error) {
+          const mediaError = error as DOMException | Error;
+          const shouldRetryWithoutDevice =
+            Boolean(deviceId) &&
+            (mediaError?.name === 'OverconstrainedError' ||
+              mediaError?.name === 'NotFoundError' ||
+              mediaError?.name === 'DevicesNotFoundError');
+
+          if (!shouldRetryWithoutDevice) {
+            throw error;
+          }
+
+          console.warn('[media] failed to open requested device, retrying default device', {
+            kind,
+            deviceId,
+            errorName: mediaError?.name
+          });
+          usedFallbackDevice = true;
+          requested = await navigator.mediaDevices.getUserMedia(buildConstraints(undefined));
+        }
         const track = getTrackByKind(requested, kind);
 
         if (!track) {
@@ -842,21 +1164,49 @@ export const useCallRoom = () => {
           track.contentHint = 'motion';
         }
 
+        track.addEventListener('ended', () => {
+          void syncAllPeerTracks();
+          void sendMediaState();
+        });
+
         track.enabled = enabled;
         await replaceLocalTrack(kind, track);
+        const actualDeviceId = track.getSettings().deviceId;
+        if (kind === 'audio') {
+          console.log('[media] audio input track applied', {
+            requestedDeviceId: deviceId || '(default)',
+            actualDeviceId: actualDeviceId || '(unknown)',
+            usedFallbackDevice
+          });
+          const warning = resolveAudioInputWarning({
+            requestedDeviceId: deviceId,
+            actualDeviceId,
+            usedFallbackDevice
+          });
+          if (warning) {
+            setErrorMessage(warning);
+          }
+        }
         await enumerateDevices();
       } catch (error) {
         console.error(error);
+        const mediaError = error as DOMException | Error;
+        const accessDenied =
+          mediaError?.name === 'NotAllowedError' || mediaError?.name === 'PermissionDeniedError';
         setErrorMessage(
           kind === 'audio'
-            ? 'Не удалось включить микрофон. Проверь доступ браузера к устройству.'
-            : 'Не удалось включить камеру. Проверь доступ браузера к устройству.'
+            ? accessDenied
+              ? 'Не удалось включить микрофон: доступ запрещён. Разрешите микрофон в браузере и нажмите кнопку микрофона повторно.'
+              : 'Не удалось включить микрофон. Проверьте доступ браузера к устройству и повторите попытку.'
+            : accessDenied
+              ? 'Не удалось включить камеру: доступ запрещён. Разрешите камеру в браузере и нажмите кнопку камеры повторно.'
+              : 'Не удалось включить камеру. Проверьте доступ браузера к устройству и повторите попытку.'
         );
       } finally {
         setIsConnectingMedia(false);
       }
     },
-    [enumerateDevices, replaceLocalTrack]
+    [enumerateDevices, replaceLocalTrack, sendMediaState, syncAllPeerTracks]
   );
 
   const ensureAudioTrack = useCallback(async () => {
@@ -907,7 +1257,37 @@ export const useCallRoom = () => {
 
   const handleSignal = useCallback(
     async (fromParticipantId: string, signal: SignalPayload) => {
+      const remoteParticipant = callStateRef.current.participants.find((item) => item.id === fromParticipantId);
+      if (!remoteParticipant || remoteParticipant.connectionState !== 'connected') {
+        console.log('[rtc] signal ignored for non-active participant', {
+          participantId: fromParticipantId,
+          signalType: signal.type
+        });
+        return;
+      }
+
       const peer = ensurePeerRecord(fromParticipantId);
+      const expectedVersion = peer.version;
+      const isStalePeer = () => {
+        const currentPeer = peersRef.current.get(fromParticipantId);
+        return (
+          !currentPeer ||
+          isPeerOperationStale({
+            currentVersion: currentPeer.version,
+            expectedVersion,
+            signalingState: currentPeer.pc.signalingState
+          })
+        );
+      };
+      if (isStalePeer()) {
+        console.log('[rtc] signal ignored for stale peer', {
+          participantId: fromParticipantId,
+          peerVersion: expectedVersion,
+          signalType: signal.type
+        });
+        return;
+      }
+
       const readyForOffer =
         !peer.makingOffer && (peer.pc.signalingState === 'stable' || peer.isSettingRemoteAnswerPending);
 
@@ -920,6 +1300,9 @@ export const useCallRoom = () => {
         peer.pendingIceCandidates = [];
 
         for (const queuedCandidate of queuedCandidates) {
+          if (isStalePeer()) {
+            return;
+          }
           try {
             await peer.pc.addIceCandidate(queuedCandidate);
           } catch (error) {
@@ -929,6 +1312,20 @@ export const useCallRoom = () => {
       };
 
       if (signal.type === 'candidate') {
+        if (
+          !canApplyCandidateOrAnswer({
+            signalingState: peer.pc.signalingState,
+            currentVersion: peersRef.current.get(fromParticipantId)?.version,
+            expectedVersion
+          }) ||
+          isStalePeer()
+        ) {
+          console.log('[rtc] candidate ignored for closed/stale peer', {
+            participantId: fromParticipantId,
+            peerVersion: expectedVersion
+          });
+          return;
+        }
         const hasRemoteDescription = Boolean(
           peer.pc.remoteDescription ?? peer.pc.currentRemoteDescription ?? peer.pc.pendingRemoteDescription
         );
@@ -954,20 +1351,41 @@ export const useCallRoom = () => {
       const offerCollision = description.type === 'offer' && !readyForOffer;
       peer.ignoreOffer = !peer.polite && offerCollision;
       if (peer.ignoreOffer) {
+        console.log('[rtc] signal ignored due to offer collision policy', {
+          participantId: fromParticipantId,
+          peerVersion: expectedVersion
+        });
         return;
       }
 
       if (offerCollision) {
+        if (String(peer.pc.connectionState) === 'closed' || isStalePeer()) {
+          return;
+        }
         await peer.pc.setLocalDescription({ type: 'rollback' });
       }
 
+      if (String(peer.pc.connectionState) === 'closed' || isStalePeer()) {
+        console.log('[rtc] description ignored for closed/stale peer', {
+          participantId: fromParticipantId,
+          peerVersion: expectedVersion,
+          descriptionType: description.type
+        });
+        return;
+      }
       peer.isSettingRemoteAnswerPending = description.type === 'answer';
       await peer.pc.setRemoteDescription(description);
       peer.isSettingRemoteAnswerPending = false;
       await flushPendingIceCandidates();
 
       if (description.type === 'offer') {
+        if (isStalePeer()) {
+          return;
+        }
         await syncPeerTracks(fromParticipantId);
+        if (String(peer.pc.connectionState) === 'closed' || isStalePeer()) {
+          return;
+        }
         await peer.pc.setLocalDescription();
         if (peer.pc.localDescription) {
           socketRef.current?.emit('signal:send', {
@@ -985,6 +1403,7 @@ export const useCallRoom = () => {
 
   const teardown = useCallback(() => {
     clearJoinAckTimer();
+    clearInitialJoinTimer();
     socketRef.current?.removeAllListeners();
     socketRef.current?.disconnect();
     socketRef.current = null;
@@ -1002,17 +1421,22 @@ export const useCallRoom = () => {
     localScreenStreamRef.current = null;
     setLocalMediaStream(null);
     setLocalScreenStream(null);
-  }, [clearJoinAckTimer, closeAllPeers, stopAllTracks]);
+  }, [clearInitialJoinTimer, clearJoinAckTimer, closeAllPeers, stopAllTracks]);
 
   const leaveRoom = useCallback(() => {
     const socket = socketRef.current;
+    const leaveOperationId = ++leaveOperationIdRef.current;
     let didTeardown = false;
     const finishLeave = () => {
       if (didTeardown) {
         return;
       }
+      if (leaveOperationId !== leaveOperationIdRef.current) {
+        return;
+      }
 
       didTeardown = true;
+      console.log('[room] leave finalized', { leaveOperationId });
       teardown();
     };
 
@@ -1030,6 +1454,7 @@ export const useCallRoom = () => {
     dispatch({ type: 'session/reset' });
     setErrorMessage(null);
     setJoinState('idle');
+    console.log('[room] leave started', { leaveOperationId, hadSocket: Boolean(socket) });
   }, [teardown]);
 
   const startLocalPreviewSession = useCallback(
@@ -1081,23 +1506,40 @@ export const useCallRoom = () => {
   );
 
   const joinRoom = useCallback(
-    async ({ roomId, displayName, clientSessionId, sessionToken }: JoinForm) => {
+    async ({ roomId, displayName, clientSessionId, sessionToken, anonymousAuthToken }: JoinForm) => {
+      leaveOperationIdRef.current += 1;
       setJoinState('joining');
       setErrorMessage(null);
       setResolvedSessionToken('');
       dispatch({ type: 'session/reset' });
       localParticipantIdRef.current = '';
       localPreviewModeRef.current = false;
-      activeJoinSessionRef.current = { roomId, displayName, clientSessionId, sessionToken };
+      const resolvedAnonymousAuthToken = anonymousAuthToken || ensureAnonymousAuthToken();
+      activeJoinSessionRef.current = {
+        roomId,
+        displayName,
+        clientSessionId,
+        sessionToken,
+        anonymousAuthToken: resolvedAnonymousAuthToken
+      };
       hasJoinedRoomRef.current = false;
+      preJoinConnectErrorsRef.current = 0;
       clearJoinAckTimer();
+      clearInitialJoinTimer();
       socketRef.current?.removeAllListeners();
       socketRef.current?.disconnect();
       closeAllPeers();
 
       const allowLocalPreview = canUseLocalPreviewFallback();
       const socket = io(serverUrl, {
-        transports: ['websocket']
+        transports: ['polling', 'websocket'],
+        tryAllTransports: true,
+        forceNew: true,
+        timeout: SOCKET_CONNECT_TIMEOUT_MS,
+        reconnection: true,
+        reconnectionAttempts: 2,
+        reconnectionDelay: 1_000,
+        reconnectionDelayMax: 3_000
       });
 
       socketRef.current = socket;
@@ -1108,6 +1550,7 @@ export const useCallRoom = () => {
         }
 
         clearJoinAckTimer();
+        clearInitialJoinTimer();
 
         if (allowLocalPreview) {
           await startLocalPreviewSession({
@@ -1131,11 +1574,24 @@ export const useCallRoom = () => {
         setJoinState('error');
       };
 
+      initialJoinTimerRef.current = window.setTimeout(() => {
+        if (hasJoinedRoomRef.current) {
+          return;
+        }
+
+        void failInitialJoin('Unable to connect to the room server. Check the network and try again.');
+      }, INITIAL_JOIN_MAX_WAIT_MS);
+
       const emitJoinRequest = () => {
         const activeSession = activeJoinSessionRef.current;
         if (!activeSession) {
           return;
         }
+        const joinAttemptId = `${activeSession.roomId}:${++joinAttemptCounterRef.current}`;
+        console.log('[room] join attempt started', {
+          joinAttemptId,
+          roomId: activeSession.roomId
+        });
 
         clearJoinAckTimer();
         joinAckTimerRef.current = window.setTimeout(() => {
@@ -1158,9 +1614,16 @@ export const useCallRoom = () => {
             }
             return;
           }
+          console.log('[room] join attempt ack', {
+            joinAttemptId,
+            roomId: response.roomId,
+            participantId: response.participantId,
+            participantsCount: response.participants.length
+          });
 
           const isFirstJoin = !hasJoinedRoomRef.current;
           hasJoinedRoomRef.current = true;
+          clearInitialJoinTimer();
           localParticipantIdRef.current = response.participantId;
           const nextSessionToken = response.sessionToken || response.clientSessionId;
           setResolvedSessionToken(nextSessionToken);
@@ -1168,7 +1631,8 @@ export const useCallRoom = () => {
             roomId: response.roomId,
             displayName: activeSession.displayName,
             clientSessionId: activeSession.clientSessionId,
-            sessionToken: nextSessionToken
+            sessionToken: nextSessionToken,
+            anonymousAuthToken: activeSession.anonymousAuthToken
           };
 
           dispatch({ type: 'participants/synced', participants: response.participants });
@@ -1196,6 +1660,10 @@ export const useCallRoom = () => {
       };
 
       socket.on('connect', () => {
+        console.log('[socket] connected', {
+          socketId: socket.id,
+          preJoinConnectErrors: preJoinConnectErrorsRef.current
+        });
         if (hasJoinedRoomRef.current && localParticipantIdRef.current) {
           updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
         }
@@ -1223,13 +1691,13 @@ export const useCallRoom = () => {
           if (!current) {
             return;
           }
-
-          if (participant.screenStreamId && current.cameraStream?.id === participant.screenStreamId) {
-            current.screenStream = current.cameraStream;
-            current.cameraStream = undefined;
+          const reconciled = reconcileRemoteMediaBuckets({ current, participant });
+          const pruned = pruneRemoteMediaState(reconciled);
+          if (!pruned.cameraStream && !pruned.screenStream) {
+            draft.delete(participant.id);
+            return;
           }
-
-          draft.set(participant.id, current);
+          draft.set(participant.id, pruned);
         });
 
         if (
@@ -1246,13 +1714,7 @@ export const useCallRoom = () => {
       socket.on(
         'participant:left',
         ({ participantId, participants, message }: { participantId: string; participants: WireParticipant[]; message: ChatMessage }) => {
-          clearPeerRecovery(participantId);
-          clearMediaRecovery(participantId);
-          peersRef.current.get(participantId)?.pc.close();
-          peersRef.current.delete(participantId);
-          updateRemoteStreams((draft) => {
-            draft.delete(participantId);
-          });
+          disposeParticipantPeer(participantId, 'participant-left');
           dispatch({ type: 'participants/synced', participants });
           dispatch({ type: 'chat/messageReceived', message });
         }
@@ -1273,6 +1735,12 @@ export const useCallRoom = () => {
       socket.on(
         'signal:received',
         async ({ fromParticipantId, signal }: { fromParticipantId: string; signal: SignalPayload }) => {
+          const signalSeq = ++signalSequenceRef.current;
+          console.log('[rtc] signal received', {
+            signalSeq,
+            fromParticipantId,
+            signalType: signal.type
+          });
           try {
             await handleSignal(fromParticipantId, signal);
           } catch (error) {
@@ -1285,18 +1753,42 @@ export const useCallRoom = () => {
         clearJoinAckTimer();
 
         if (!hasJoinedRoomRef.current) {
-          void failInitialJoin('Connection to the room server was interrupted before the join completed.');
+          console.warn('[socket] disconnected before join completed', {
+            socketId: socket.id,
+            active: socket.active
+          });
           return;
         }
 
         updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
       });
 
-      socket.on('connect_error', () => {
-        clearJoinAckTimer();
+      socket.on('connect_error', (error: Error & { description?: unknown; context?: unknown }) => {
+        preJoinConnectErrorsRef.current += 1;
+        console.warn('[socket] connect error', {
+          socketId: socket.id,
+          attempt: preJoinConnectErrorsRef.current,
+          active: socket.active,
+          message: error?.message,
+          description: error?.description,
+          context: error?.context
+        });
 
         if (hasJoinedRoomRef.current) {
           updateParticipantConnectionState(localParticipantIdRef.current, 'reconnecting');
+          return;
+        }
+      });
+
+      socket.io.on('reconnect_attempt', (attempt) => {
+        console.log('[socket.io] reconnect attempt', {
+          attempt,
+          joined: hasJoinedRoomRef.current
+        });
+      });
+
+      socket.io.on('reconnect_failed', () => {
+        if (hasJoinedRoomRef.current) {
           return;
         }
 
@@ -1304,10 +1796,11 @@ export const useCallRoom = () => {
       });
     },
     [
+      clearInitialJoinTimer,
       clearJoinAckTimer,
-      clearMediaRecovery,
       clearPeerRecovery,
       closeAllPeers,
+      disposeParticipantPeer,
       enumerateDevices,
       ensureRemoteMediaRecovery,
       handleSignal,
@@ -1327,17 +1820,96 @@ export const useCallRoom = () => {
     sendMediaState();
   }, [sendMediaState, stopAllTracks, syncAllPeerTracks]);
 
+  const applyScreenSharePreset = useCallback(
+    async (presetId: ScreenSharePresetId) => {
+      setSelectedScreenSharePresetId(presetId);
+      selectedScreenSharePresetIdRef.current = presetId;
+
+      const stream = localScreenStreamRef.current;
+      const videoTrack = getTrackByKind(stream, 'video');
+      if (!videoTrack) {
+        return;
+      }
+
+      const preset = getScreenSharePreset(presetId);
+      try {
+        await videoTrack.applyConstraints(toDisplayVideoConstraints(preset));
+      } catch (error) {
+        console.warn('Failed to apply screen share constraints', { presetId, error });
+      }
+
+      await syncAllPeerTracks();
+      await sendMediaState();
+    },
+    [sendMediaState, syncAllPeerTracks]
+  );
+
+  const verifyScreenShareQuality = useCallback(
+    async (videoTrack: MediaStreamTrack, presetId: ScreenSharePresetId) => {
+      const preset = getScreenSharePreset(presetId);
+      const settings = videoTrack.getSettings();
+      const settingsOk = isScreenSharePresetSatisfiedBySettings(preset, {
+        width: settings.width,
+        height: settings.height,
+        frameRate: settings.frameRate
+      });
+
+      let senderFps: number | undefined;
+      const firstPeer = peersRef.current.values().next().value as PeerRecord | undefined;
+      const sender = firstPeer?.senders.screenVideo;
+      if (sender && typeof sender.getStats === 'function') {
+        try {
+          const stats = await sender.getStats();
+          for (const stat of stats.values()) {
+            if (stat.type === 'outbound-rtp' && stat.kind === 'video') {
+              senderFps = stat.framesPerSecond;
+              break;
+            }
+          }
+        } catch (error) {
+          console.warn('[screen-share] sender stats read failed', { presetId, error });
+        }
+      }
+
+      const fpsTarget = Math.floor(preset.fps * 0.9);
+      const senderFpsOk = senderFps === undefined ? true : senderFps >= fpsTarget;
+      const verified = settingsOk && senderFpsOk;
+
+      console.log('[screen-share] quality verification', {
+        presetId,
+        requested: { width: preset.width, height: preset.height, fps: preset.fps },
+        actual: {
+          width: settings.width,
+          height: settings.height,
+          frameRate: settings.frameRate,
+          senderFps
+        },
+        verified
+      });
+
+      if (!verified) {
+        setErrorMessage(
+          `Не удалось подтвердить режим ${preset.label}: фактически ${settings.width ?? '?'}x${settings.height ?? '?'} @ ${
+            Math.round(settings.frameRate ?? 0) || '?'
+          } FPS.`
+        );
+      }
+    },
+    []
+  );
+
   const startScreenShare = useCallback(async () => {
     try {
       const canShareAudio = callStateRef.current.policy.allowSystemAudio;
+      const presetId = selectedScreenSharePresetIdRef.current;
+      const preset = getScreenSharePreset(presetId);
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          frameRate: 15
-        },
+        video: toDisplayVideoConstraints(preset),
         audio: canShareAudio
       });
 
-      displayStream.getVideoTracks()[0]?.addEventListener('ended', () => {
+      const screenVideoTrack = displayStream.getVideoTracks()[0] ?? null;
+      screenVideoTrack?.addEventListener('ended', () => {
         void stopScreenShare();
       });
 
@@ -1348,11 +1920,16 @@ export const useCallRoom = () => {
 
       await syncAllPeerTracks();
       sendMediaState();
+      if (screenVideoTrack) {
+        window.setTimeout(() => {
+          void verifyScreenShareQuality(screenVideoTrack, presetId);
+        }, 1_200);
+      }
     } catch (error) {
       console.error(error);
       setErrorMessage('Не удалось запустить демонстрацию экрана.');
     }
-  }, [sendMediaState, stopAllTracks, stopScreenShare, syncAllPeerTracks]);
+  }, [sendMediaState, stopAllTracks, stopScreenShare, syncAllPeerTracks, verifyScreenShareQuality]);
 
   const sendChatMessage = useCallback(() => {
     const text = pendingMessage.trim();
@@ -1412,11 +1989,8 @@ export const useCallRoom = () => {
     async (deviceId: string) => {
       setSelectedAudioInputId(deviceId);
       const existing = getTrackByKind(localMediaStreamRef.current, 'audio');
-      if (!existing) {
-        return;
-      }
-
-      await requestTrack('audio', deviceId, existing.enabled);
+      const shouldEnable = existing ? existing.enabled : true;
+      await requestTrack('audio', deviceId, shouldEnable);
     },
     [requestTrack]
   );
@@ -1471,6 +2045,8 @@ export const useCallRoom = () => {
     selectedAudioInputId,
     selectedAudioOutputId,
     selectedVideoInputId,
+    selectedScreenSharePresetId,
+    screenSharePresets: SCREEN_SHARE_PRESETS,
     pendingMessage,
     activePanel,
     isConnectingMedia,
@@ -1489,6 +2065,7 @@ export const useCallRoom = () => {
     pinParticipant,
     applyAudioInput,
     applyAudioOutput,
-    applyVideoInput
+    applyVideoInput,
+    applyScreenSharePreset
   };
 };
