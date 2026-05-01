@@ -4,6 +4,7 @@ import type { ChatMessage, ParticipantSnapshot, RoomPolicy } from '../domain/roo
 export const joinRoomSchema = z.object({
   roomId: z.string().trim().min(2).max(64),
   displayName: z.string().trim().min(1).max(48),
+  anonymousAuthToken: z.string().trim().min(16).max(2048).optional(),
   clientSessionId: z.string().trim().min(8).max(2048).optional(),
   sessionToken: z.string().trim().min(8).max(2048).optional()
 });
@@ -37,15 +38,35 @@ export const signalSchema = z.object({
   ])
 });
 
-export const mediaStateSchema = z.object({
-  isCameraOn: z.boolean().optional(),
-  isMicOn: z.boolean().optional(),
-  isSpeaking: z.boolean().optional(),
-  isScreenSharing: z.boolean().optional(),
-  isSharingAudio: z.boolean().optional(),
-  cameraStreamId: z.string().optional(),
-  screenStreamId: z.string().optional()
-});
+export const mediaStateSchema = z
+  .object({
+    isCameraOn: z.boolean().optional(),
+    isMicOn: z.boolean().optional(),
+    isSpeaking: z.boolean().optional(),
+    isScreenSharing: z.boolean().optional(),
+    isSharingAudio: z.boolean().optional(),
+    cameraStreamId: z.string().trim().min(1).max(512).optional(),
+    screenStreamId: z.string().trim().min(1).max(512).optional()
+  })
+  .superRefine((value, context) => {
+    const needsCameraStreamId = value.isCameraOn === true || value.isMicOn === true;
+    if (needsCameraStreamId && !value.cameraStreamId) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'cameraStreamId is required when camera or microphone is enabled',
+        path: ['cameraStreamId']
+      });
+    }
+
+    const needsScreenStreamId = value.isScreenSharing === true || value.isSharingAudio === true;
+    if (needsScreenStreamId && !value.screenStreamId) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'screenStreamId is required when screen sharing or system audio is enabled',
+        path: ['screenStreamId']
+      });
+    }
+  });
 
 export const speakingStateSchema = z.object({
   isSpeaking: z.boolean()

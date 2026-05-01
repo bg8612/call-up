@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Maximize2, MicOff, MonitorUp, Volume2 } from 'lucide-react';
 import type { AudioOutputMediaElement, Participant, RemoteMediaState } from '../features/call/types';
 import { Avatar, AvatarFallback } from './ui/avatar';
@@ -34,8 +34,58 @@ export const MediaTile = ({
   const screenRef = useRef<HTMLVideoElement | null>(null);
   const cameraAudioRef = useRef<HTMLAudioElement | null>(null);
   const screenAudioRef = useRef<HTMLAudioElement | null>(null);
+  const blockedPlaybackElementsRef = useRef<Set<HTMLMediaElement>>(new Set());
+  const [blockedPlaybackRevision, setBlockedPlaybackRevision] = useState(0);
   const hasCameraVideo = streamHasVideo(media?.cameraStream);
   const hasScreenVideo = streamHasVideo(media?.screenStream);
+
+  const ensureElementPlayback = useCallback((element: HTMLMediaElement | null) => {
+    if (!element) {
+      return;
+    }
+
+    const markPlaybackBlocked = () => {
+      if (blockedPlaybackElementsRef.current.has(element)) {
+        return;
+      }
+      blockedPlaybackElementsRef.current.add(element);
+      setBlockedPlaybackRevision((current) => current + 1);
+    };
+
+    const clearPlaybackBlocked = () => {
+      if (!blockedPlaybackElementsRef.current.delete(element)) {
+        return;
+      }
+      setBlockedPlaybackRevision((current) => current + 1);
+    };
+
+    try {
+      const playAttempt = element.play();
+      if (typeof playAttempt?.catch === 'function') {
+        playAttempt
+          .then(() => {
+            clearPlaybackBlocked();
+          })
+          .catch((error) => {
+            markPlaybackBlocked();
+            console.warn('Failed to start media element playback', {
+              participantId: participant.id,
+              tagName: element.tagName,
+              error
+            });
+          });
+      } else {
+        clearPlaybackBlocked();
+      }
+    } catch (error) {
+      markPlaybackBlocked();
+      console.warn('Failed to start media element playback', {
+        participantId: participant.id,
+        tagName: element.tagName,
+        error
+      });
+    }
+  }, [participant.id]);
 
   const bindMediaStream = useCallback((element: HTMLMediaElement | null, stream?: MediaStream) => {
     if (!element) {
@@ -46,7 +96,11 @@ export const MediaTile = ({
     if (element.srcObject !== nextStream) {
       element.srcObject = nextStream;
     }
-  }, []);
+
+    if (nextStream) {
+      ensureElementPlayback(element);
+    }
+  }, [ensureElementPlayback]);
 
   const setCameraVideoRef = useCallback(
     (element: HTMLVideoElement | null) => {
@@ -95,6 +149,40 @@ export const MediaTile = ({
   useEffect(() => {
     bindMediaStream(screenAudioRef.current, media?.screenStream);
   }, [bindMediaStream, media?.screenStream, participant.isSharingAudio]);
+
+  useEffect(() => {
+    ensureElementPlayback(cameraRef.current);
+    ensureElementPlayback(screenRef.current);
+    ensureElementPlayback(cameraAudioRef.current);
+    ensureElementPlayback(screenAudioRef.current);
+  }, [
+    ensureElementPlayback,
+    media?.cameraStream,
+    media?.screenStream,
+    participant.isCameraOn,
+    participant.isMicOn,
+    participant.isScreenSharing,
+    participant.isSharingAudio
+  ]);
+
+  useEffect(() => {
+    if (blockedPlaybackElementsRef.current.size === 0) {
+      return;
+    }
+
+    const retryBlockedPlayback = () => {
+      const blockedElements = [...blockedPlaybackElementsRef.current];
+      blockedElements.forEach((element) => ensureElementPlayback(element));
+    };
+
+    window.addEventListener('pointerdown', retryBlockedPlayback, true);
+    window.addEventListener('keydown', retryBlockedPlayback, true);
+
+    return () => {
+      window.removeEventListener('pointerdown', retryBlockedPlayback, true);
+      window.removeEventListener('keydown', retryBlockedPlayback, true);
+    };
+  }, [blockedPlaybackRevision, ensureElementPlayback]);
 
   useEffect(() => {
     const applySinkId = async (element: AudioOutputMediaElement | null) => {

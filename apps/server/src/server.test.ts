@@ -86,19 +86,29 @@ const joinRoom = async (
   payload: {
     roomId: string;
     displayName: string;
+    anonymousAuthToken?: string;
     clientSessionId?: string;
     sessionToken?: string;
   }
 ) =>
   new Promise<Extract<JoinAck, { ok: true }>>((resolve, reject) => {
-    socket.emit('room:join', payload, (response: JoinAck) => {
+    socket.emit(
+      'room:join',
+      {
+        ...payload,
+        anonymousAuthToken:
+          payload.anonymousAuthToken ??
+          `anon-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+      },
+      (response: JoinAck) => {
       if (!response.ok) {
         reject(new Error(response.error));
         return;
       }
 
       resolve(response);
-    });
+      }
+    );
   });
 
 describe('createAppServer', () => {
@@ -299,6 +309,206 @@ describe('createAppServer', () => {
     await expect(onceWithTimeout(guestSocket, 'participant:left')).resolves.toBeNull();
   });
 
+  it('rejects join when anonymous authorization token is missing', async () => {
+    const roomId = nextRoomId();
+    const socket = await connectClient(serverUrl);
+    sockets.push(socket);
+
+    const failedAck = await new Promise<JoinAck>((resolve) => {
+      socket.emit(
+        'room:join',
+        {
+          roomId,
+          displayName: 'Alex',
+          clientSessionId: 'client-missing-anon-token-1'
+        },
+        (response: JoinAck) => resolve(response)
+      );
+    });
+
+    expect(failedAck).toMatchObject({
+      ok: false,
+      error: 'Anonymous authorization token is required'
+    });
+  });
+
+  it('rejects repeated join to the same room from the same anonymous token', async () => {
+    const roomId = nextRoomId();
+    const anonymousAuthToken = 'anon-repeat-same-room-1';
+    const firstSocket = await connectClient(serverUrl);
+    const secondSocket = await connectClient(serverUrl);
+    sockets.push(firstSocket, secondSocket);
+
+    await joinRoom(firstSocket, {
+      roomId,
+      displayName: 'Alex',
+      anonymousAuthToken,
+      clientSessionId: 'client-repeat-same-room-1'
+    });
+
+    const failedAck = await new Promise<JoinAck>((resolve) => {
+      secondSocket.emit(
+        'room:join',
+        {
+          roomId,
+          displayName: 'Alex clone',
+          anonymousAuthToken,
+          clientSessionId: 'client-repeat-same-room-2'
+        },
+        (response: JoinAck) => resolve(response)
+      );
+    });
+
+    expect(failedAck).toMatchObject({
+      ok: false,
+      error: 'This browser has already joined this room. Re-entry is blocked for the same anonymous token.'
+    });
+  });
+
+  it('moves anonymous token binding to another room and finalizes previous participant', async () => {
+    const anonymousAuthToken = 'anon-repeat-cross-room-1';
+    const roomA = nextRoomId();
+    const roomB = nextRoomId();
+    const firstSocket = await connectClient(serverUrl);
+    const observerSocket = await connectClient(serverUrl);
+    const secondSocket = await connectClient(serverUrl);
+    sockets.push(firstSocket, observerSocket, secondSocket);
+
+    await joinRoom(firstSocket, {
+      roomId: roomA,
+      displayName: 'Alex',
+      anonymousAuthToken,
+      clientSessionId: 'client-cross-room-1'
+    });
+    await joinRoom(observerSocket, {
+      roomId: roomA,
+      displayName: 'Mira',
+      clientSessionId: 'client-cross-room-observer'
+    });
+
+    const oldRoomLeft = once<{
+      participantId: string;
+      participants: Array<{ displayName: string }>;
+      message: { text: string };
+    }>(observerSocket, 'participant:left');
+    const roomBAck = await joinRoom(secondSocket, {
+      roomId: roomB,
+      displayName: 'Alex clone',
+      anonymousAuthToken,
+      clientSessionId: 'client-cross-room-2'
+    });
+
+    expect(roomBAck.roomId).toBe(roomB);
+    await expect(oldRoomLeft).resolves.toMatchObject({
+      participants: [expect.objectContaining({ displayName: 'Mira' })],
+      message: { text: 'Alex left the room' }
+    });
+  });
+
+  it('allows joining again with the same anonymous token after explicit leave', async () => {
+    const roomId = nextRoomId();
+    const anonymousAuthToken = 'anon-rejoin-after-leave-1';
+    const firstSocket = await connectClient(serverUrl);
+    const secondSocket = await connectClient(serverUrl);
+    const thirdSocket = await connectClient(serverUrl);
+    sockets.push(firstSocket, secondSocket, thirdSocket);
+
+    await joinRoom(firstSocket, {
+      roomId,
+      displayName: 'Alex',
+      anonymousAuthToken,
+      clientSessionId: 'client-rejoin-after-leave-1'
+    });
+
+    await new Promise<void>((resolve) => {
+      firstSocket.emit('room:leave', () => resolve());
+    });
+
+    const sameRoomAck = await joinRoom(secondSocket, {
+      roomId,
+      displayName: 'Alex again',
+      anonymousAuthToken,
+      clientSessionId: 'client-rejoin-after-leave-2'
+    });
+    expect(sameRoomAck.roomId).toBe(roomId);
+
+    await new Promise<void>((resolve) => {
+      secondSocket.emit('room:leave', () => resolve());
+    });
+
+    const otherRoomAck = await joinRoom(thirdSocket, {
+      roomId: nextRoomId(),
+      displayName: 'Alex other room',
+      anonymousAuthToken,
+      clientSessionId: 'client-rejoin-after-leave-3'
+    });
+    expect(otherRoomAck.ok).toBe(true);
+  });
+
+  it('allows joining again with the same anonymous token after reconnect grace finalization', async () => {
+    const roomA = nextRoomId();
+    const roomB = nextRoomId();
+    const anonymousAuthToken = 'anon-rejoin-after-timeout-1';
+    const firstSocket = await connectClient(serverUrl);
+    const secondSocket = await connectClient(serverUrl);
+    sockets.push(firstSocket, secondSocket);
+
+    await joinRoom(firstSocket, {
+      roomId: roomA,
+      displayName: 'Alex',
+      anonymousAuthToken,
+      clientSessionId: 'client-rejoin-after-timeout-1'
+    });
+
+    vi.useFakeTimers();
+    appServer!.io.sockets.sockets.get(firstSocket.id)?.disconnect(true);
+    await vi.advanceTimersByTimeAsync(15_000);
+    vi.useRealTimers();
+
+    const joinAfterTimeoutAck = await joinRoom(secondSocket, {
+      roomId: roomB,
+      displayName: 'Alex after timeout',
+      anonymousAuthToken,
+      clientSessionId: 'client-rejoin-after-timeout-2'
+    });
+
+    expect(joinAfterTimeoutAck.roomId).toBe(roomB);
+  });
+
+  it('does not emit a second leave when disconnect happens after explicit room:leave', async () => {
+    const roomId = nextRoomId();
+    const ownerSocket = await connectClient(serverUrl);
+    const guestSocket = await connectClient(serverUrl);
+    sockets.push(ownerSocket, guestSocket);
+
+    await joinRoom(ownerSocket, {
+      roomId,
+      displayName: 'Alex',
+      clientSessionId: 'client-owner-leave-disconnect-1'
+    });
+    const guestJoinAck = await joinRoom(guestSocket, {
+      roomId,
+      displayName: 'Mira',
+      clientSessionId: 'client-guest-leave-disconnect-1'
+    });
+
+    const firstLeftEvent = once<{
+      participantId: string;
+      message: { kind: 'system'; text: string };
+    }>(ownerSocket, 'participant:left');
+    guestSocket.emit('room:leave');
+
+    await expect(firstLeftEvent).resolves.toMatchObject({
+      participantId: guestJoinAck.participantId,
+      message: { text: 'Mira left the room' }
+    });
+
+    guestSocket.disconnect();
+
+    await expect(onceWithTimeout(ownerSocket, 'participant:left')).resolves.toBeNull();
+    await expect(onceWithTimeout(ownerSocket, 'participant:updated')).resolves.toBeNull();
+  });
+
   it('marks a participant as reconnecting and removes them after the grace period', async () => {
     const roomId = nextRoomId();
     const ownerSocket = await connectClient(serverUrl);
@@ -337,7 +547,7 @@ describe('createAppServer', () => {
       message: { kind: 'system'; text: string };
     }>(ownerSocket, 'participant:left');
 
-    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(15_000);
 
     await expect(removedEvent).resolves.toMatchObject({
       participantId: guestJoinAck.participantId,
@@ -351,6 +561,7 @@ describe('createAppServer', () => {
 
   it('restores the same participant on rejoin with a server-issued session token', async () => {
     const roomId = nextRoomId();
+    const guestAnonymousToken = 'anon-rejoin-token-room-1';
     const ownerSocket = await connectClient(serverUrl);
     const guestSocket = await connectClient(serverUrl);
     sockets.push(ownerSocket, guestSocket);
@@ -363,6 +574,7 @@ describe('createAppServer', () => {
     const guestJoinAck = await joinRoom(guestSocket, {
       roomId,
       displayName: 'Mira',
+      anonymousAuthToken: guestAnonymousToken,
       clientSessionId: 'client-guest-4444'
     });
 
@@ -392,6 +604,7 @@ describe('createAppServer', () => {
     const rejoinAck = await joinRoom(rejoinedSocket, {
       roomId,
       displayName: 'Mira',
+      anonymousAuthToken: guestAnonymousToken,
       sessionToken: guestJoinAck.sessionToken
     });
 
@@ -405,10 +618,93 @@ describe('createAppServer', () => {
         connectionState: 'connected'
       }
     });
+
+    const healthResponse = await fetch(`${serverUrl}/health`);
+    const health = (await healthResponse.json()) as {
+      metrics: { reconnectTimers: number };
+    };
+    expect(health.metrics.reconnectTimers).toBe(0);
+  });
+
+  it('restores the same participant on rejoin with clientSessionId when token is missing', async () => {
+    const roomId = nextRoomId();
+    const guestAnonymousToken = 'anon-rejoin-token-room-2';
+    const ownerSocket = await connectClient(serverUrl);
+    const guestSocket = await connectClient(serverUrl);
+    sockets.push(ownerSocket, guestSocket);
+
+    await joinRoom(ownerSocket, {
+      roomId,
+      displayName: 'Alex',
+      clientSessionId: 'client-owner-restore-1'
+    });
+    const guestJoinAck = await joinRoom(guestSocket, {
+      roomId,
+      displayName: 'Mira',
+      anonymousAuthToken: guestAnonymousToken,
+      clientSessionId: 'client-guest-restore-1'
+    });
+
+    appServer!.io.sockets.sockets.get(guestSocket.id)?.disconnect(true);
+    await once(ownerSocket, 'participant:updated');
+
+    const rejoinedSocket = await connectClient(serverUrl);
+    sockets.push(rejoinedSocket);
+
+    const ownerUpdatedEvent = once<{
+      participant: { id: string; socketId: string; connectionState: 'connected' | 'reconnecting' };
+    }>(ownerSocket, 'participant:updated');
+    const rejoinAck = await joinRoom(rejoinedSocket, {
+      roomId,
+      displayName: 'Mira',
+      anonymousAuthToken: guestAnonymousToken,
+      clientSessionId: 'client-guest-restore-1'
+    });
+
+    expect(rejoinAck.participantId).toBe(guestJoinAck.participantId);
+    await expect(ownerUpdatedEvent).resolves.toMatchObject({
+      participant: {
+        id: guestJoinAck.participantId,
+        socketId: rejoinedSocket.id,
+        connectionState: 'connected'
+      }
+    });
+  });
+
+  it('treats explicit client disconnect as leave, not reconnecting', async () => {
+    const roomId = nextRoomId();
+    const ownerSocket = await connectClient(serverUrl);
+    const guestSocket = await connectClient(serverUrl);
+    sockets.push(ownerSocket, guestSocket);
+
+    await joinRoom(ownerSocket, {
+      roomId,
+      displayName: 'Alex',
+      clientSessionId: 'client-owner-disconnect-1'
+    });
+    const guestJoinAck = await joinRoom(guestSocket, {
+      roomId,
+      displayName: 'Mira',
+      clientSessionId: 'client-guest-disconnect-1'
+    });
+
+    const reconnectingEvent = onceWithTimeout(ownerSocket, 'participant:updated');
+    const leftEvent = once(ownerSocket, 'participant:left');
+    guestSocket.disconnect();
+
+    await expect(reconnectingEvent).resolves.toBeNull();
+    await expect(leftEvent).resolves.toMatchObject({
+      participantId: guestJoinAck.participantId,
+      message: {
+        kind: 'system',
+        text: 'Mira left the room'
+      }
+    });
   });
 
   it('evicts the previous socket from room broadcasts on duplicate session rebind', async () => {
     const roomId = nextRoomId();
+    const guestAnonymousToken = 'anon-rebind-token-1';
     const ownerSocket = await connectClient(serverUrl);
     const guestSocket = await connectClient(serverUrl);
     const duplicateSocket = await connectClient(serverUrl);
@@ -422,6 +718,7 @@ describe('createAppServer', () => {
     const guestJoinAck = await joinRoom(guestSocket, {
       roomId,
       displayName: 'Mira',
+      anonymousAuthToken: guestAnonymousToken,
       clientSessionId: 'client-guest-rebind-1'
     });
 
@@ -429,6 +726,7 @@ describe('createAppServer', () => {
     const rebindAck = await joinRoom(duplicateSocket, {
       roomId,
       displayName: 'Mira',
+      anonymousAuthToken: guestAnonymousToken,
       sessionToken: guestJoinAck.sessionToken
     });
 
